@@ -80,6 +80,7 @@ def llama_new_forward(
         img_start_idx = self.img_start_idx
         img_end_idx = self.img_end_idx
         bbox_mask = self.bbox_mask if hasattr(self, "bbox_mask") else None
+        target_text_idx = self.target_text_idx if hasattr(self, "target_text_idx") else None
     else:
         use_attn = False
 
@@ -92,17 +93,18 @@ def llama_new_forward(
         if bbox_mask is not None:
             # Apply attention boost only to bounding box regions
             # bbox_mask shape: [576] - boolean mask for image tokens
-            img_attn = attn_weights[:, :, -1, img_start_idx:img_end_idx]  # [bsz, num_heads, 576]
-            img_attn[:, :, bbox_mask] = (
-                img_attn[:, :, bbox_mask].abs() * self.alpha
-                + img_attn[:, :, bbox_mask]
+            #import pdb; pdb.set_trace()
+            img_attn = attn_weights[:, :, target_text_idx-1:-1, img_start_idx:img_end_idx]  # [bsz, num_heads, 576]
+            img_attn[:, :, :, bbox_mask] = (
+                img_attn[:, :, :, bbox_mask].abs() * self.alpha
+                + img_attn[:, :, :, bbox_mask]
             )
-            attn_weights[:, :, -1, img_start_idx:img_end_idx] = img_attn
+            attn_weights[:, :, target_text_idx-1:-1, img_start_idx:img_end_idx] = img_attn
         else:
             # Original behavior: boost all image tokens
-            attn_weights[:, :, -1, img_start_idx:img_end_idx] = (
-                attn_weights[:, :, -1, img_start_idx:img_end_idx].abs() * self.alpha
-                + attn_weights[:, :, -1, img_start_idx:img_end_idx]
+            attn_weights[:, :, target_text_idx-1:-1, img_start_idx:img_end_idx] = (
+                attn_weights[:, :, target_text_idx-1:-1, img_start_idx:img_end_idx].abs() * self.alpha
+                + attn_weights[:, :, target_text_idx-1:-1, img_start_idx:img_end_idx]
             )
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
@@ -129,12 +131,13 @@ def llama_new_forward(
 
 
 def llama_modify(model, start_layer, end_layer, use_attn, alpha, use_cfg,
-                 img_start_idx, img_end_idx, bbox_mask):
+                 img_start_idx, img_end_idx, bbox_mask, target_text_idx):
     for i in range(start_layer, end_layer):
         model.model.layers[i].self_attn.use_attn = use_attn
         model.model.layers[i].self_attn.alpha = alpha
         model.model.layers[i].self_attn.use_cfg = use_cfg
         model.model.layers[i].self_attn.img_start_idx = img_start_idx
         model.model.layers[i].self_attn.img_end_idx = img_end_idx
+        model.model.layers[i].self_attn.target_text_idx = target_text_idx
         model.model.layers[i].self_attn.bbox_mask = bbox_mask
         model.model.layers[i].self_attn.forward = types.MethodType(llama_new_forward, model.model.layers[i].self_attn)

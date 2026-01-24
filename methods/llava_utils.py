@@ -192,7 +192,9 @@ def prompt_to_img_input_ids(prompt, tokenizer):
 def get_img_idx(model, model_name, tokenizer, text_prompt):
     conv = generate_text_prompt(model["model"], model_name, text_prompt)
     input_ids = prompt_to_img_input_ids(conv.get_prompt(), tokenizer)
-    return input_ids.tolist()[0].index(-200), input_ids.tolist()[0].index(-200) + 576
+    image_patch_tokens = 576  # 24x24 patches
+    actual_prefix_len = input_ids.shape[1] - 1 + 576
+    return input_ids.tolist()[0].index(-200), input_ids.tolist()[0].index(-200) + 576, actual_prefix_len
 
 def run_llava_model(
     model,

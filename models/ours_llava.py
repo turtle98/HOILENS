@@ -330,12 +330,20 @@ class HOILLAVA(nn.Module):
 
 
             #human = labels[x_keep]
-            objects = targets[0]["object"].unique()
-            #objects = labels[o_unique_indices].unique()
-            candidate_texts_per_pair = [text.replace("a photo of a ", "")  for obj_idx in objects.cpu().tolist()
-                                        for (verb_idx, object_idx), text in hico_text_label.hico_text_label.items()
-                                        if object_idx == obj_idx]
+            #objects = targets[0]["object"].unique()
+            #objects = labels[o_unique_indices]
+            #candidate_texts_per_pair = [text.replace("a photo of a ", "")  for obj_idx in objects.cpu().tolist()
+                                        #for (verb_idx, object_idx), text in hico_text_label.hico_text_label.items()
+                                        #if object_idx == obj_idx]
 
+            objects = labels[y_keep]
+            candidate_texts_per_pair = []
+            for obj_idx in objects.cpu().tolist():
+                # Get full candidates and strip "a photo of a " prefix
+                candidates = [text.replace("a photo of a ", "") 
+                            for (verb_idx, object_idx), text in hico_text_label.hico_text_label.items() 
+                            if object_idx == obj_idx]
+                candidate_texts_per_pair.append(candidates)
             #import pdb; pdb.set_trace()
             bbox_2_tokens = bbox_to_token((336,336),boxes, 24)
             bool_h = bbox_2_tokens[x_keep]
@@ -353,37 +361,42 @@ class HOILLAVA(nn.Module):
             #     model_loader.img_end_idx,
             # )
 
-            img_start_idx, img_end_idx = get_img_idx(self.clip_head, self.clip_head['model_name'], self.clip_head['tokenizer'],  "Provide the correct human-object interaction in the image: a photo of a ")
+            img_start_idx, img_end_idx, prefix_prompt_end_idx = get_img_idx(self.clip_head, self.clip_head['model_name'], self.clip_head['tokenizer'],  "Provide the correct human-object interaction in the image: a photo of a ")
 
-            # llama_modify(
-            #     self.clip_head['model'],
-            #     2,
-            #     32,
-            #     True,
-            #     0.2,
-            #     False,
-            #     img_start_idx,
-            #     img_end_idx,
-            # )
+
+            #import pdb; pdb.set_trace()
 
             results_per_object = []
-            for candidates in candidate_texts_per_pair:
-                #import pdb; pdb.set_trace()
-                log_probs, probs = compute_conditional_likelihood_llava(
-                    self.clip_head,
-                    self.clip_head['model_name'],
-                    image.decompose()[0][b_idx:b_idx + 1].half(),
-                    (336,336),
-                    self.clip_head['tokenizer'],
-                    "Provide the correct human-object interaction in the image: a photo of a ",
-                    candidates,   # Now just ["person boarding an airplane", "person directing an airplane", ...]
+            for i in range(bool_union.shape[0]):
+                llama_modify(
+                    self.clip_head['model'],
+                    15,
+                    24,
+                    True,
+                    0.2,
+                    False,
+                    img_start_idx,
+                    img_end_idx,
+                    bool_union[i],
+                    prefix_prompt_end_idx
                 )
+                for candidates in candidate_texts_per_pair[i]:
+                    #import pdb; pdb.set_trace()
+                    log_probs, probs = compute_conditional_likelihood_llava(
+                        self.clip_head,
+                        self.clip_head['model_name'],
+                        image.decompose()[0][b_idx:b_idx + 1].half(),
+                        (336,336),
+                        self.clip_head['tokenizer'],
+                        "Provide the correct human-object interaction in the image: a photo of a ",
+                        candidates,   # Now just ["person boarding an airplane", "person directing an airplane", ...]
+                    )
 
-                # Save candidates with their probabilities
-                results_per_object.append({
-                    'candidates': candidates,
-                    'probs': probs,
-                })
+                    # Save candidates with their probabilities
+                    results_per_object.append({
+                        'candidates': candidates,
+                        'probs': probs,
+                    })
 
             # Sort by probability (descending order)
             results_per_object_sorted = sorted(results_per_object, key=lambda x: x['probs'], reverse=True)

@@ -75,7 +75,7 @@ def llama_new_forward(
         )
 
     ### PAI's modification
- if hasattr(self, "use_attn"):
+    if hasattr(self, "use_attn"):
         use_attn = self.use_attn
         img_start_idx = self.img_start_idx
         img_end_idx = self.img_end_idx

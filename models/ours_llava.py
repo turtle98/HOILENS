@@ -69,7 +69,7 @@ class MLP(nn.Module):
         return x
 
 class Llavaproj(nn.Module):
-    def __init__(self, in_dim=5120, out_dim=256):
+    def __init__(self, in_dim=4096, out_dim=256):
         super().__init__()
         self.encoder = nn.Linear(in_dim, out_dim, bias=False)
         self.norm = nn.LayerNorm(out_dim)
@@ -80,12 +80,12 @@ class Llavaproj(nn.Module):
         return z_normed
 
 class verbsteer(nn.Module):
-    def __init__(self, in_dim=5120, out_dim=5120, rank=128):
+    def __init__(self, in_dim=4096, out_dim=4096, rank=128):
         super().__init__()
-        self.lora_up = Llavaproj(rank, 5120)
+        self.lora_up = Llavaproj(rank, 4096)
         self.norm = nn.LayerNorm(rank)
-        self.decoder = TransformerDecoder(input_dim = 5120, embed_dim=rank, num_heads=8, num_layers=1)
-        self.llava_proj =  Llavaproj(5120, rank)
+        self.decoder = TransformerDecoder(input_dim = 4096, embed_dim=rank, num_heads=8, num_layers=1)
+        self.llava_proj =  Llavaproj(4096, rank)
 
     def forward(self, x, detr_feats, boxes, size, llava_feats, obj_embeds):
         x = self.norm(x)
@@ -166,7 +166,7 @@ class HOILLAVA(nn.Module):
         self.clip_head = model
 
         self.register_buffer("object_embedding",object_embedding)
-        self.visual_output_dim = 5120
+        self.visual_output_dim = 4096
         self.object_n_verb_to_interaction = np.asarray(
                                 object_n_verb_to_interaction, dtype=float
                             )
@@ -191,24 +191,24 @@ class HOILLAVA(nn.Module):
         self.dataset = args.dataset
         self.reserve_indices = reserve_indices
 
-        self.h_steer = verbsteer(in_dim=5120, out_dim=5120, rank=args.adapt_dim)
-        self.o_steer = verbsteer(in_dim=5120, out_dim=5120, rank=args.adapt_dim)
-        self.ho_steer = verbsteer(in_dim=5120, out_dim=5120, rank=args.adapt_dim)
+        self.h_steer = verbsteer(in_dim=4096, out_dim=4096, rank=args.adapt_dim)
+        self.o_steer = verbsteer(in_dim=4096, out_dim=4096, rank=args.adapt_dim)
+        self.ho_steer = verbsteer(in_dim=4096, out_dim=4096, rank=args.adapt_dim)
         #self.lm_head_embeddings = torch.load("/hub_data1/taehoonsong/HOICLIP/training_linearshortcut/lm_head_embedding.pt", "cpu")
 
-        self.verb_classifier_ho = torch.load("/hub_data1/taehoonsong/LAIN/internal_verbs_5_alllayers.pt", "cpu")[:,self.args.layer].float()
+        self.verb_classifier_ho = torch.load("/home/taehoon/HOICLIP/training_linearshortcut/verb_classifier_weights_ho_7b.pt", "cpu")[:,self.args.layer].float()
         #self.verb_classifier_ho = self.clip_head.linear_shortcut(self.verb_classifier_ho)
-        self.verb_classifier_ho = F.normalize(self.verb_classifier_ho, p=2, dim=1)
-        self.verb_projection_ho = nn.Linear(5120, 117, bias=False)
+        #self.verb_classifier_ho = F.normalize(self.verb_classifier_ho, p=2, dim=1)
+        self.verb_projection_ho = nn.Linear(4096, 117, bias=False)
         self.verb_projection_ho.weight.data = self.verb_classifier_ho
         for param in self.verb_projection_ho.parameters():
             param.requires_grad = False
     
         
-        self.text_2_queries = MLP(5120, 128, args.adapt_dim, 2)
-        self.ho_llava_2_queries = nn.Linear(5120, args.adapt_dim, bias = False)
-        self.h_llava_2_queries = nn.Linear(5120, args.adapt_dim, bias = False)
-        self.o_llava_2_queries = nn.Linear(5120, args.adapt_dim, bias = False)
+        self.text_2_queries = MLP(4096, 128, args.adapt_dim, 2)
+        self.ho_llava_2_queries = nn.Linear(4096, args.adapt_dim, bias = False)
+        self.h_llava_2_queries = nn.Linear(4096, args.adapt_dim, bias = False)
+        self.o_llava_2_queries = nn.Linear(4096, args.adapt_dim, bias = False)
         self.ho_query_proj = MLP(512, 128, args.adapt_dim, 2)
         self.h_query_proj = MLP(256, 128, args.adapt_dim, 2)
         self.o_query_proj = MLP(256, 128, args.adapt_dim, 2)
@@ -282,7 +282,7 @@ class HOILLAVA(nn.Module):
             else:
                 text_prompt = "."
             
-            _ , output , last_hidden_states, caption = run_llava_model(
+            hidden_states = run_llava_model(
                 self.clip_head,
                 self.clip_head['model_name'],
                 image.decompose()[0][b_idx:b_idx + 1].half(),
@@ -291,8 +291,8 @@ class HOILLAVA(nn.Module):
                 hidden_states=True,
                 text_prompt=text_prompt
             )
-            llava_features = output[self.args.layer].float()
-            #import pdb; pdb.set_trace()
+            llava_features = hidden_states[self.args.layer].float()
+            import pdb; pdb.set_trace()
 
 
             is_human = labels == self.human_idx
@@ -334,7 +334,7 @@ class HOILLAVA(nn.Module):
             h_detr_feats = self.h_query_proj(feats[h_unique_indices])
             o_detr_feats = self.o_query_proj(feats[o_unique_indices])
            
-            text_2_query = self.text_2_queries(F.normalize(self.object_embedding[:,self.args.layer].float(), 2, -1))
+            text_2_query = self.text_2_queries(F.normalize(self.object_embedding.float(), 2, -1))
             #ing_dir = self.text_2_queries(self.ing.to(device))
             h_text = text_2_query[labels[h_unique_indices]] #+ ing_dir.unsqueeze(0)
             o_text = text_2_query[labels[o_unique_indices]] #+ ing_dir.unsqueeze(0)
@@ -369,14 +369,14 @@ class HOILLAVA(nn.Module):
             roi_boxes2 = torch.cat([batch_indices2[:, None].float(), boxes_xyxy2], dim=1)  # shape [K, 5]
 
 
-            h_feats0 = torchvision.ops.roi_align(llava_features.view(1, 24, 24, 5120).permute(0, 3, 1, 2),  roi_boxes,
+            h_feats0 = torchvision.ops.roi_align(llava_features.view(1, 24, 24, 4096).permute(0, 3, 1, 2),  roi_boxes,
                                                     output_size=(7, 7),
                                                     spatial_scale=24 / 336, aligned=True)
-            o_feats0 = torchvision.ops.roi_align(llava_features.view(1, 24, 24, 5120).permute(0, 3, 1, 2),  roi_boxes1,
+            o_feats0 = torchvision.ops.roi_align(llava_features.view(1, 24, 24, 4096).permute(0, 3, 1, 2),  roi_boxes1,
                                                     output_size=(7, 7),
                                                     spatial_scale=24 / 336, aligned=True)
 
-            ho_feats0 = torchvision.ops.roi_align(llava_features.view(1, 24, 24, 5120).permute(0, 3, 1, 2), roi_boxes2,
+            ho_feats0 = torchvision.ops.roi_align(llava_features.view(1, 24, 24, 4096).permute(0, 3, 1, 2), roi_boxes2,
                                                     output_size=(7, 7),
                                                     spatial_scale=24 / 336, aligned=True)
 
@@ -399,55 +399,11 @@ class HOILLAVA(nn.Module):
             ho_tokens, _ = self.ho_steer(ho_feats1, ho_detr_feats, union_boxes, targets[b_idx]['size'], llava_features, ho_text)
             #self.verb_projection_ho(ho_tokens + torch.sigmoid(self.ho_alpha_logit) * ho_feats0)
 
-            ho_logits = self.verb_projection_ho(ho_tokens) #+ torch.sigmoid(self.ho_alpha_logit) * ho_feats0) #/ math.sqrt(5120)
-            h_logits = self.verb_projection_ho(h_tokens) #+ torch.sigmoid(self.h_alpha_logit) * h_feats0) #/ math.sqrt(5120)
-            o_logits = self.verb_projection_ho(o_tokens) #+ torch.sigmoid(self.o_alpha_logit) * o_feats0) #/ math.sqrt(5120)
+            ho_logits = self.verb_projection_ho(ho_tokens) #+ torch.sigmoid(self.ho_alpha_logit) * ho_feats0) #/ math.sqrt(4096)
+            h_logits = self.verb_projection_ho(h_tokens) #+ torch.sigmoid(self.h_alpha_logit) * h_feats0) #/ math.sqrt(4096)
+            o_logits = self.verb_projection_ho(o_tokens) #+ torch.sigmoid(self.o_alpha_logit) * o_feats0) #/ math.sqrt(4096)
             
-            
-            logits = (ho_logits + h_logits[h_inverse_indices] + o_logits[o_inverse_indices])/3
-            if self.args.zse:
-                ho_logits1 = self.verb_projection_ho(ho_feats0) #/ math.sqrt(5120)
-                h_logits1 = self.verb_projection_ho(h_feats0) #/ math.sqrt(5120)
-                o_logits1 = self.verb_projection_ho(o_feats0) #/ math.sqrt(5120)
 
-                # Standardize each row
-                mean = ho_logits1.mean(dim=1, keepdim=True)
-                std = ho_logits1.std(dim=1, keepdim=True) + 1e-6  # prevent division by zero
-                ho_logits_std1 = (ho_logits1 - mean) / std
-
-                mean = h_logits1.mean(dim=1, keepdim=True)
-                std = h_logits1.std(dim=1, keepdim=True) + 1e-6  # prevent division by zero
-                h_logits_std1 = (h_logits1 - mean) / std
-
-                mean = o_logits1.mean(dim=1, keepdim=True)
-                std = o_logits1.std(dim=1, keepdim=True) + 1e-6  # prevent division by zero
-                o_logits_std1 = (o_logits1 - mean) / std
-                zse = (ho_logits_std1 + h_logits_std1[h_inverse_indices] +o_logits_std1[o_inverse_indices])/3
-                cse1 = (ho_logits1 + h_logits1[h_inverse_indices] +o_logits1[o_inverse_indices])/3
-            if self.args.cse: 
-                global_mean_logit = self.verb_projection_ho(llava_features).squeeze(0).mean(0)
-                cse1 = (ho_logits1 + h_logits1[h_inverse_indices] +o_logits1[o_inverse_indices])/3
-                cse2 = cse1 - global_mean_logit
-                mean = global_mean_logit.mean(dim=0, keepdim=True)
-                std = global_mean_logit.std(dim=0, keepdim=True)
-                global_logits1 = (global_mean_logit - mean) / std
-                ho_logits2 = (ho_logits1 - global_mean_logit)
-                h_logits2 = (h_logits1 - global_mean_logit)
-                o_logits2 = (o_logits1 - global_mean_logit)
-
-                p_global = F.softmax(global_logits1, dim=-1)
-                p_ho = F.softmax(ho_logits_std1, dim=-1)
-                p_h  = F.softmax(h_logits_std1, dim=-1)
-                p_o  = F.softmax(o_logits_std1, dim=-1)
-
-                kl_ho = F.kl_div(p_ho.log(), p_global, reduction='none').sum(-1).unsqueeze(1)
-                kl_h  = F.kl_div(p_h.log(),  p_global, reduction='none').sum(-1).unsqueeze(1)
-                kl_o  = F.kl_div(p_o.log(),  p_global, reduction='none').sum(-1).unsqueeze(1)
-                cse_ada = ( ho_logits2 + h_logits2[h_inverse_indices] + o_logits2[o_inverse_indices]) /3 
-   
-                logits1 = logits + zse
-                logits2 = logits + cse2
-                import pdb; pdb.set_trace()
 
         
             boxes_h_collated.append(x_keep)
@@ -675,15 +631,6 @@ class HOILLAVA(nn.Module):
 
         return detections
 
-@torch.no_grad()
-def get_obj_text_emb(args, clip_model, obj_class_names):
-    obj_text_inputs = torch.cat([tokenize(obj_text) for obj_text in obj_class_names])
-    with torch.no_grad():
-        obj_text_embedding = clip_model.encode_text(obj_text_inputs)
-        object_embedding = obj_text_embedding
-        # obj_text_embedding = obj_text_embedding[hoi_obj_list,:]
-    return object_embedding
-
 
 ###added rank
 def build_detector(args, class_corr, object_n_verb_to_interaction, clip_model_path, rank):
@@ -716,7 +663,7 @@ def build_detector(args, class_corr, object_n_verb_to_interaction, clip_model_pa
 
 
 
-    model_name = "llava13b" 
+    model_name = "llava7b" 
 
     if model_name.startswith("llava"):
         model = load_llava_state(rank)
@@ -733,9 +680,11 @@ def build_detector(args, class_corr, object_n_verb_to_interaction, clip_model_pa
     #model = CustomCLIP(args, classnames=classnames, clip_model=clip_model)
 
     obj_class_names = [obj[1] for obj in hico_text_label.hico_obj_text_label]
-    object_embedding = torch.load("/hub_data1/taehoonsong/LAIN/internal_objects_5_alllayers.pt", "cpu")
+    object_embedding = torch.load("/home/taehoon/HOICLIP/training_linearshortcut/obj_classifier_7b.pt", "cpu")
     object_embedding = object_embedding.clone().detach()
 
+
+    import pdb; pdb.set_trace()
     detector = HOILLAVA(args,
         detr, postprocessors['bbox'], model, object_embedding,
         human_idx=args.human_idx, num_classes=args.num_classes,

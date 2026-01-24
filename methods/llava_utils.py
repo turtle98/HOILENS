@@ -72,32 +72,6 @@ def generate_text_prompt(model, model_name, text_prompt):
     return conv
 
 
-def add_diffusion_noise(image_tensor, noise_step):
-    num_steps = 1000  # Number of diffusion steps
-
-    # decide beta in each step
-    betas = torch.linspace(-6,6,num_steps)
-    betas = torch.sigmoid(betas) * (0.5e-2 - 1e-5) + 1e-5
-
-    # decide alphas in each step
-    alphas = 1 - betas
-    alphas_prod = torch.cumprod(alphas, dim=0)
-    alphas_prod_p = torch.cat([torch.tensor([1]).float(), alphas_prod[:-1]],0) # p for previous
-    alphas_bar_sqrt = torch.sqrt(alphas_prod)
-    one_minus_alphas_bar_log = torch.log(1 - alphas_prod)
-    one_minus_alphas_bar_sqrt = torch.sqrt(1 - alphas_prod)
-
-    def q_x(x_0,t):
-        noise = torch.randn_like(x_0)
-        alphas_t = alphas_bar_sqrt[t]
-        alphas_1_m_t = one_minus_alphas_bar_sqrt[t]
-        return (alphas_t*x_0 + alphas_1_m_t*noise)
-
-    noise_delta = int(noise_step) # from 0-999
-    noisy_image = image_tensor.clone()
-    image_tensor_cd = q_x(noisy_image,noise_step) 
-
-    return image_tensor_cd
 
 def generate_images_tensor(model, img_path, image_processor):
     image_files = [img_path]
@@ -108,19 +82,6 @@ def generate_images_tensor(model, img_path, image_processor):
         model.device, dtype=torch.float16
     ).unsqueeze(0)
 
-
-    return images_tensor, images, image_sizes
-
-def generate_images_tensor1(model, img_path, image_processor):
-    image_files = [img_path]
-    images = load_images(image_files)
-    image_sizes = [x.size for x in images]
-
-    images_tensor = process_images(images, image_processor, model.config).to(
-        model.device, dtype=torch.float16
-    )
-
-    images_tensor= add_diffusion_noise(images_tensor,500)
 
     return images_tensor, images, image_sizes
 
@@ -180,13 +141,8 @@ def run_llava_model(
 
     hidden_states = torch.stack(output.hidden_states[0])
     image_token_index = input_ids.tolist()[0].index(-200)
-    last_hidden_states = hidden_states[:, :, -1, :]
     hidden_states = hidden_states[:, :, image_token_index : image_token_index + (24 * 24),:]
-    cls_token = model["model"].model.vision_tower.cls_token
-    cls_token = cls_token.to(dtype=torch.float16).clone()   # break "inference" status
-    cls_proj  = model["model"].model.mm_projector(cls_token)
- 
-    return cls_proj, hidden_states, last_hidden_states, outputs
+    return hidden_states
 
 
 def retrieve_logit_lens_llava(state, img_path, args, text_prompt = None):
@@ -286,7 +242,7 @@ def get_caption_from_llava(
 
 
 def load_llava_state(rank):
-    model_path = "liuhaotian/llava-v1.5-13b"
+    model_path = "liuhaotian/llava-v1.5-7b"
     model_name = get_model_name_from_path(model_path)
 
     # Don't use device=..., pass directly to map loading

@@ -9,8 +9,8 @@ CUDA_VISIBLE_DEVICES=4 torchrun --rdzv_id $id --rdzv_backend=c10d --nproc_per_no
          main_llava_training.py --pretrained checkpoints/pretrained_detr/detr-r50-hicodet.pth --clip_dir_vit checkpoints/pretrained_clip/ViT-L-14-336px.pt --output-dir /home/taehoon/HOILENS/checkpoints/ECCV \
          --dataset hicodet --zs --zs_type non_rare_first --num_classes 117 --num-workers 4 \
          --epochs 10 --lr-head 1e-4 --lr-drop 5 \
-         --adapt_dim 128 --batch-size 8 \
-         --print-interval 100 --layer 30 
+         --adapt_dim 128 --batch-size 1 \
+         --print-interval 100 --layer 30 --eval
 
 
 # CUDA_VISIBLE_DEVICES=3,5 torchrun --rdzv_id $id --rdzv_backend=c10d --nproc_per_node=$gpu_num --rdzv_endpoint=127.0.0.1:$port \

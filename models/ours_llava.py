@@ -52,7 +52,7 @@ body_parts = ["Mouth", "Eyes","Arms","Hand","Feet","Legs"]
 
 """
 
-from methods.llava_utils import retrieve_logit_lens_llava, load_llava_state, run_llava_model
+from methods.llava_utils import retrieve_logit_lens_llava, load_llava_state, run_llava_model, compute_conditional_likelihood_llava
 
 class MLP(nn.Module):
     """ Very simple multi-layer perceptron (also called FFN)"""
@@ -196,7 +196,7 @@ class HOILLAVA(nn.Module):
         self.ho_steer = verbsteer(in_dim=4096, out_dim=4096, rank=args.adapt_dim)
         #self.lm_head_embeddings = torch.load("/hub_data1/taehoonsong/HOICLIP/training_linearshortcut/lm_head_embedding.pt", "cpu")
 
-        self.verb_classifier_ho = torch.load("/home/taehoon/HOICLIP/training_linearshortcut/verb_classifier_weights_ho_7b.pt", "cpu")[:,self.args.layer].float()
+        self.verb_classifier_ho = torch.load("/home/taehoon/HOICLIP/training_linearshortcut/verb_classifier_weights_ho_7b.pt", "cpu").float()
         #self.verb_classifier_ho = self.clip_head.linear_shortcut(self.verb_classifier_ho)
         #self.verb_classifier_ho = F.normalize(self.verb_classifier_ho, p=2, dim=1)
         self.verb_projection_ho = nn.Linear(4096, 117, bias=False)
@@ -277,11 +277,9 @@ class HOILLAVA(nn.Module):
             scores = props['scores']
             labels = props['labels']
             feats = props['feat']
-            if self.args.cls_token:
-                text_prompt = "Provide 5 single word actions that can be visually identified between humans and objects in this image."
-            else:
-                text_prompt = "."
+
             
+
             hidden_states = run_llava_model(
                 self.clip_head,
                 self.clip_head['model_name'],
@@ -289,10 +287,10 @@ class HOILLAVA(nn.Module):
                 (336,336),
                 self.clip_head['tokenizer'],
                 hidden_states=True,
-                text_prompt=text_prompt
+                text_prompt="."
             )
             llava_features = hidden_states[self.args.layer].float()
-            import pdb; pdb.set_trace()
+            # import pdb; pdb.set_trace()
 
 
             is_human = labels == self.human_idx
@@ -328,6 +326,55 @@ class HOILLAVA(nn.Module):
             #import pdb; pdb.set_trace()
             h_unique_indices, h_inverse_indices = torch.unique(x_keep, return_inverse=True)
             o_unique_indices, o_inverse_indices = torch.unique(y_keep, return_inverse=True)
+
+
+            #human = labels[x_keep]
+            objects = targets[0]["object"].unique()
+            #objects = labels[o_unique_indices].unique()
+            candidate_texts_per_pair = [text.replace("a photo of a ", "")  for obj_idx in objects.cpu().tolist()
+                                        for (verb_idx, object_idx), text in hico_text_label.hico_text_label.items()
+                                        if object_idx == obj_idx]
+
+            #import pdb; pdb.set_trace()
+            bbox_2_tokens = bbox_to_token((336,336),boxes, 24)
+            bool_h = bbox_2_tokens[x_keep]
+            bool_o = bbox_2_tokens[y_keep]
+            bool_union = bool_h | bool_o
+            # llama_modify(
+            #     model_loader.llm_model,
+            #     args.start_layer,
+            #     args.end_layer,
+            #     args.use_attn,
+            #     args.alpha,
+            #     args.use_cfg,
+            #     model_loader.img_start_idx,
+            #     model_loader.img_end_idx,
+            # )
+
+            results_per_object = []
+            for candidates in candidate_texts_per_pair:
+                #import pdb; pdb.set_trace()
+                log_probs, probs = compute_conditional_likelihood_llava(
+                    self.clip_head,
+                    self.clip_head['model_name'],
+                    image.decompose()[0][b_idx:b_idx + 1].half(),
+                    (336,336),
+                    self.clip_head['tokenizer'],
+                    "Provide the correct human-object interaction in the image: a photo of a ",
+                    candidates,   # Now just ["person boarding an airplane", "person directing an airplane", ...]
+                )
+
+                # Save candidates with their probabilities
+                results_per_object.append({
+                    'candidates': candidates,
+                    'probs': probs,
+                })
+
+            # Sort by probability (descending order)
+            results_per_object_sorted = sorted(results_per_object, key=lambda x: x['probs'], reverse=True)
+
+
+            #import pdb; pdb.set_trace()
 
 
             ho_detr_feats = self.ho_query_proj(torch.cat([feats[x_keep],feats[y_keep]],dim=-1))
@@ -388,22 +435,22 @@ class HOILLAVA(nn.Module):
             #     o_feats1 = self.o_llava_2_queries(o_feats0 + last_hidden_states[30].float())
             #     ho_feats1 = self.ho_llava_2_queries(ho_feats0 + last_hidden_states[30].float())
             # else:
-            h_feats1 = self.h_llava_2_queries(h_feats0)
-            o_feats1 = self.o_llava_2_queries(o_feats0)
-            ho_feats1 = self.ho_llava_2_queries(ho_feats0)
-            if self.args.cls_token:
-                llava_features = torch.cat([llava_features, last_hidden_states[self.args.layer].unsqueeze(1)], dim=1)
+            # h_feats1 = self.h_llava_2_queries(h_feats0)
+            # o_feats1 = self.o_llava_2_queries(o_feats0)
+            # ho_feats1 = self.ho_llava_2_queries(ho_feats0)
+            # import pdb; pdb.set_trace()
 
-            h_tokens , _ = self.h_steer(h_feats1, h_detr_feats, boxes[h_unique_indices], targets[b_idx]['size'], llava_features, h_text)
-            o_tokens , _ = self.o_steer(o_feats1, o_detr_feats, boxes[o_unique_indices], targets[b_idx]['size'], llava_features, o_text) 
-            ho_tokens, _ = self.ho_steer(ho_feats1, ho_detr_feats, union_boxes, targets[b_idx]['size'], llava_features, ho_text)
+            # h_tokens , _ = self.h_steer(h_feats1, h_detr_feats, boxes[h_unique_indices], targets[b_idx]['size'], llava_features, h_text)
+            # o_tokens , _ = self.o_steer(o_feats1, o_detr_feats, boxes[o_unique_indices], targets[b_idx]['size'], llava_features, o_text) 
+            # ho_tokens, _ = self.ho_steer(ho_feats1, ho_detr_feats, union_boxes, targets[b_idx]['size'], llava_features, ho_text)
             #self.verb_projection_ho(ho_tokens + torch.sigmoid(self.ho_alpha_logit) * ho_feats0)
-
-            ho_logits = self.verb_projection_ho(ho_tokens) #+ torch.sigmoid(self.ho_alpha_logit) * ho_feats0) #/ math.sqrt(4096)
-            h_logits = self.verb_projection_ho(h_tokens) #+ torch.sigmoid(self.h_alpha_logit) * h_feats0) #/ math.sqrt(4096)
-            o_logits = self.verb_projection_ho(o_tokens) #+ torch.sigmoid(self.o_alpha_logit) * o_feats0) #/ math.sqrt(4096)
+            #import pdb; pdb.set_trace()
+            ho_logits = self.verb_projection_ho(ho_feats0) #+ torch.sigmoid(self.ho_alpha_logit) * ho_feats0) #/ math.sqrt(4096)
+            h_logits = self.verb_projection_ho(h_feats0) #+ torch.sigmoid(self.h_alpha_logit) * h_feats0) #/ math.sqrt(4096)
+            o_logits = self.verb_projection_ho(o_feats0) #+ torch.sigmoid(self.o_alpha_logit) * o_feats0) #/ math.sqrt(4096)
             
 
+            logits = ho_logits
 
         
             boxes_h_collated.append(x_keep)
@@ -413,10 +460,9 @@ class HOILLAVA(nn.Module):
                 x_keep, y_keep, scores, labels)
             )
             all_logits_collated.append(logits)
-            all_zs_logits_collated.append(zse)
-            #import pdb; pdb.set_trace()
+            import pdb; pdb.set_trace()
 
-        return all_logits_collated, prior_collated, boxes_h_collated, boxes_o_collated, object_class_collated, all_zs_logits_collated
+        return all_logits_collated, prior_collated, boxes_h_collated, boxes_o_collated, object_class_collated
 
     def recover_boxes(self, boxes, size):
         #import pdb; pdb.set_trace()
@@ -449,7 +495,7 @@ class HOILLAVA(nn.Module):
         # print("#(labels==1) = ", torch.sum(labels))
         return labels
 
-    def compute_interaction_loss(self, boxes, bh, bo, logits, prior, targets, zs_logits): ### loss
+    def compute_interaction_loss(self, boxes, bh, bo, logits, prior, targets): ### loss
         ## bx, bo: indices of boxes
 
         #import pdb; pdb.set_trace()
@@ -463,26 +509,6 @@ class HOILLAVA(nn.Module):
         x, y = torch.nonzero(prior).unbind(1)
         #import pdb; pdb.set_trace()
         logits = torch.cat(logits)
-        zs_logits = torch.cat(zs_logits)
-
-        p = F.log_softmax(logits, dim=-1)
-        q = F.softmax(zs_logits.detach(), dim=-1)  
-        kl_loss_local = F.kl_div(p, q, reduction='none').sum(dim=-1)
-
-
-        kl_sum = kl_loss_local.sum()
-        kl_count = torch.tensor([kl_loss_local.numel()], device=logits.device, dtype=torch.float)
-
-
-        if dist.is_initialized():
-            dist.all_reduce(kl_sum, op=dist.ReduceOp.SUM)
-            dist.all_reduce(kl_count, op=dist.ReduceOp.SUM)
-
-        kl_loss = kl_sum / (kl_count + 1e-8)
-
-
-        lambda_kl = 0.5
-
 
         logits = logits[x, y]; prior = prior[x, y]; labels = labels[x, y]
 
@@ -503,7 +529,7 @@ class HOILLAVA(nn.Module):
         alpha=self.alpha, gamma=self.gamma
         )
         #import pdb; pdb.set_trace()
-        return (loss / n_p)  + lambda_kl * kl_loss
+        return (loss / n_p)
 
     def prepare_region_proposals(self, results): ## √ detr extracts the human-object pairs
         region_props = []
@@ -589,11 +615,11 @@ class HOILLAVA(nn.Module):
         results = self.postprocessor(results, image_sizes)
         region_props = self.prepare_region_proposals(results)
         images_clip = nested_tensor_from_tensor_list(images_clip)
-        logits, prior, bh, bo, objects, zs_logits = self.compute_sim_scores(region_props,images_clip,targets, None )
+        logits, prior, bh, bo, objects = self.compute_sim_scores(region_props,images_clip,targets, None )
         boxes = [r['boxes'] for r in region_props]
 
         if self.training:
-            interaction_loss = self.compute_interaction_loss(boxes, bh, bo, logits, prior, targets, zs_logits)
+            interaction_loss = self.compute_interaction_loss(boxes, bh, bo, logits, prior, targets)
 
             loss_dict = dict(
                 interaction_loss=interaction_loss
@@ -684,7 +710,7 @@ def build_detector(args, class_corr, object_n_verb_to_interaction, clip_model_pa
     object_embedding = object_embedding.clone().detach()
 
 
-    import pdb; pdb.set_trace()
+    #import pdb; pdb.set_trace()
     detector = HOILLAVA(args,
         detr, postprocessors['bbox'], model, object_embedding,
         human_idx=args.human_idx, num_classes=args.num_classes,

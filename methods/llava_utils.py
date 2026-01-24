@@ -31,6 +31,101 @@ from transformers.generation.logits_process import TopKLogitsWarper
 from transformers.generation.logits_process import LogitsProcessorList
 
 
+def compute_conditional_likelihood_llava(
+    model,
+    model_name,
+    images_tensor,
+    image_sizes,
+    tokenizer,
+    prefix_prompt,  # e.g., "Select the correct interaction from the list:"
+    target_text,   # List of strings, e.g., ["a photo of a person kicking a ball", ...]
+):
+    """
+    Compute the conditional log-likelihood of target texts given an image and prefix.
+    
+    Args:
+        model: LLaVA model dict with 'model' key
+        model_name: Name of the model
+        images_tensor: Preprocessed image tensor
+        image_sizes: Image sizes
+        tokenizer: Tokenizer
+        prefix_prompt: The question/prompt text (image token will be auto-inserted)
+        target_texts: List of candidate answer strings to score
+    
+    Returns:
+        log_probs: List of average log probabilities for each target text
+        probs: List of probabilities (exponentiated log probs)
+    """
+    # Generate conversation template with prefix
+    conv = generate_text_prompt(model["model"], model_name, prefix_prompt)
+    prefix_with_image = conv.get_prompt()
+    
+    # Tokenize prefix (contains image token placeholder -200)
+    prefix_ids = prompt_to_img_input_ids(prefix_with_image, tokenizer)
+    
+    log_probs = []
+    
+    with torch.inference_mode():
+        # Tokenize target text (continuation after prefix)
+        target_ids = tokenizer.encode(target_text, add_special_tokens=False)
+        target_ids = torch.tensor(target_ids, dtype=torch.long, device=prefix_ids.device)
+        
+        # Concatenate: [prefix with <image>] + [target text]
+        full_input_ids = torch.cat([prefix_ids, target_ids.unsqueeze(0)], dim=1)
+        #import pdb; pdb.set_trace()
+        ids = full_input_ids[0]
+        valid = (ids >= 0) & (ids < tokenizer.vocab_size)
+        # Forward pass to get logits
+        outputs = model["model"](
+            input_ids=full_input_ids,
+            images=images_tensor,
+            image_sizes=image_sizes,
+            return_dict=True,
+        )
+        
+        # Logits shape: [batch_size, seq_len, vocab_size]
+        logits = outputs.logits
+
+        # Get logits that predict target tokens
+
+        # image_token_index = full_input_ids.tolist()[0].index(-200)
+        # num_image_tokens = (prefix_ids == image_token_index).sum().item()
+        image_patch_tokens = 576  # 24x24 patches
+        actual_prefix_len = prefix_ids.shape[1] - 1 + 576
+        target_len = len(target_ids)
+        target_logits = logits[0, actual_prefix_len-1:actual_prefix_len-1+target_len, :]
+        #import pdb; pdb.set_trace()
+        # Compute log softmax
+        log_probs_dist = torch.nn.functional.log_softmax(target_logits, dim=-1)
+        
+        # Extract log prob of actual target tokens
+        token_log_probs = log_probs_dist[range(target_len), target_ids]
+        
+        # Average log probability across tokens
+        avg_log_prob = token_log_probs.mean().item()
+        log_probs.append(avg_log_prob)
+
+    # Convert to probabilities
+    probs = [np.exp(lp) for lp in log_probs]
+    
+    return log_probs, probs
+
+
+# Example usage:
+# target_texts = [
+#     "a photo of a person kicking a ball",
+#     "a photo of a person holding a cup",
+#     "a photo of a person riding a bike"
+# ]
+# log_probs, probs = compute_conditional_likelihood_llava(
+#     model, model_name, images_tensor, image_sizes, tokenizer,
+#     prefix_prompt="Select the correct interaction from the list:",
+#     target_texts=target_texts
+# )
+# best_idx = np.argmax(probs)
+# print(f"Best match: {target_texts[best_idx]} with prob {probs[best_idx]:.4f}")
+
+
 # Get the token embeddings from LLaVA
 def get_vocab_embeddings_llava(llm_model, tokenizer, device="cuda"):
     vocab = tokenizer.get_vocab()

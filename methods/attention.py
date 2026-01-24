@@ -129,11 +129,12 @@ def llama_new_forward(
 
 
 def llama_modify(model, start_layer, end_layer, use_attn, alpha, use_cfg,
-                 img_start_idx, img_end_idx):
+                 img_start_idx, img_end_idx, bbox_mask):
     for i in range(start_layer, end_layer):
         model.model.layers[i].self_attn.use_attn = use_attn
         model.model.layers[i].self_attn.alpha = alpha
         model.model.layers[i].self_attn.use_cfg = use_cfg
         model.model.layers[i].self_attn.img_start_idx = img_start_idx
         model.model.layers[i].self_attn.img_end_idx = img_end_idx
+        model.model.layers[i].self_attn.bbox_mask = bbox_mask
         model.model.layers[i].self_attn.forward = types.MethodType(llama_new_forward, model.model.layers[i].self_attn)

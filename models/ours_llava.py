@@ -42,6 +42,7 @@ from detr.util.misc import nested_tensor_from_tensor_list
 #from llava.model.multimodal_projector.builder import build_vision_projector
 from transformers import CLIPVisionModel, CLIPImageProcessor
 from transformers import AutoConfig
+
 sys.path.pop(0)
 import math
 import random
@@ -52,8 +53,8 @@ body_parts = ["Mouth", "Eyes","Arms","Hand","Feet","Legs"]
 
 """
 
-from methods.llava_utils import retrieve_logit_lens_llava, load_llava_state, run_llava_model, compute_conditional_likelihood_llava
-
+from methods.llava_utils import retrieve_logit_lens_llava, load_llava_state, run_llava_model, compute_conditional_likelihood_llava, get_img_idx
+from methods.attention import llama_modify
 class MLP(nn.Module):
     """ Very simple multi-layer perceptron (also called FFN)"""
 
@@ -340,8 +341,9 @@ class HOILLAVA(nn.Module):
             bool_h = bbox_2_tokens[x_keep]
             bool_o = bbox_2_tokens[y_keep]
             bool_union = bool_h | bool_o
+
             # llama_modify(
-            #     model_loader.llm_model,
+            #     self.clip_head['model'],
             #     args.start_layer,
             #     args.end_layer,
             #     args.use_attn,
@@ -349,6 +351,19 @@ class HOILLAVA(nn.Module):
             #     args.use_cfg,
             #     model_loader.img_start_idx,
             #     model_loader.img_end_idx,
+            # )
+
+            img_start_idx, img_end_idx = get_img_idx(self.clip_head, self.clip_head['model_name'], self.clip_head['tokenizer'],  "Provide the correct human-object interaction in the image: a photo of a ")
+
+            # llama_modify(
+            #     self.clip_head['model'],
+            #     2,
+            #     32,
+            #     True,
+            #     0.2,
+            #     False,
+            #     img_start_idx,
+            #     img_end_idx,
             # )
 
             results_per_object = []

@@ -188,7 +188,11 @@ def prompt_to_img_input_ids(prompt, tokenizer):
         .cuda()
     )
     return input_ids
-
+    
+def get_img_idx(model, model_name, tokenizer, text_prompt):
+    conv = generate_text_prompt(model["model"], model_name, text_prompt)
+    input_ids = prompt_to_img_input_ids(conv.get_prompt(), tokenizer)
+    return input_ids.tolist()[0].index(-200), input_ids.tolist()[0].index(-200) + 576
 
 def run_llava_model(
     model,

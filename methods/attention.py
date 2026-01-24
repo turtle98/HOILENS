@@ -75,10 +75,11 @@ def llama_new_forward(
         )
 
     ### PAI's modification
-    if hasattr(self, "use_attn"):
+ if hasattr(self, "use_attn"):
         use_attn = self.use_attn
         img_start_idx = self.img_start_idx
         img_end_idx = self.img_end_idx
+        bbox_mask = self.bbox_mask if hasattr(self, "bbox_mask") else None
     else:
         use_attn = False
 
@@ -88,11 +89,21 @@ def llama_new_forward(
         use_cfg = False
 
     if use_attn and not use_cfg:
-        attn_weights[:, :, -1, img_start_idx:img_end_idx] = (
-            attn_weights[:, :, -1, img_start_idx:img_end_idx].abs() * self.alpha
-            + attn_weights[:, :, -1, img_start_idx:img_end_idx]
-        )
-    ### PAI's modification
+        if bbox_mask is not None:
+            # Apply attention boost only to bounding box regions
+            # bbox_mask shape: [576] - boolean mask for image tokens
+            img_attn = attn_weights[:, :, -1, img_start_idx:img_end_idx]  # [bsz, num_heads, 576]
+            img_attn[:, :, bbox_mask] = (
+                img_attn[:, :, bbox_mask].abs() * self.alpha
+                + img_attn[:, :, bbox_mask]
+            )
+            attn_weights[:, :, -1, img_start_idx:img_end_idx] = img_attn
+        else:
+            # Original behavior: boost all image tokens
+            attn_weights[:, :, -1, img_start_idx:img_end_idx] = (
+                attn_weights[:, :, -1, img_start_idx:img_end_idx].abs() * self.alpha
+                + attn_weights[:, :, -1, img_start_idx:img_end_idx]
+            )
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
         query_states.dtype

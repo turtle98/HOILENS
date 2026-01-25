@@ -100,8 +100,10 @@ def compute_conditional_likelihood_llava(
         
         # Extract log prob of actual target tokens
         token_log_probs = log_probs_dist[range(target_len), target_ids]
-        
+        #import pdb; pdb.set_trace()
         # Average log probability across tokens
+        # Perplexity (lower is better)
+        # perplexity = torch.exp(-token_log_probs.mean()).item()
         avg_log_prob = token_log_probs.mean().item()
         log_probs.append(avg_log_prob)
 

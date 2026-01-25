@@ -7,7 +7,7 @@ Australian Centre for Robotic Vision
 """
 import os
 import sys
-
+from collections import defaultdict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,7 +20,7 @@ import numpy as np
 import torchvision 
 #import wandb
 
-from utils.hico_list import hico_verbs_sentence
+from utils.hico_list import hico_verbs_sentence, hico_verb_object_list, hico_verbs
 from utils.vcoco_list import vcoco_verbs_sentence
 from utils.hico_utils import reserve_indices
 from utils.postprocessor import PostProcess
@@ -192,28 +192,28 @@ class HOILLAVA(nn.Module):
         self.dataset = args.dataset
         self.reserve_indices = reserve_indices
 
-        self.h_steer = verbsteer(in_dim=4096, out_dim=4096, rank=args.adapt_dim)
-        self.o_steer = verbsteer(in_dim=4096, out_dim=4096, rank=args.adapt_dim)
-        self.ho_steer = verbsteer(in_dim=4096, out_dim=4096, rank=args.adapt_dim)
-        #self.lm_head_embeddings = torch.load("/hub_data1/taehoonsong/HOICLIP/training_linearshortcut/lm_head_embedding.pt", "cpu")
+        # self.h_steer = verbsteer(in_dim=4096, out_dim=4096, rank=args.adapt_dim)
+        # self.o_steer = verbsteer(in_dim=4096, out_dim=4096, rank=args.adapt_dim)
+        # self.ho_steer = verbsteer(in_dim=4096, out_dim=4096, rank=args.adapt_dim)
+        # #self.lm_head_embeddings = torch.load("/hub_data1/taehoonsong/HOICLIP/training_linearshortcut/lm_head_embedding.pt", "cpu")
 
-        self.verb_classifier_ho = torch.load("/home/taehoon/HOICLIP/training_linearshortcut/verb_classifier_weights_ho_7b.pt", "cpu").float()
-        #self.verb_classifier_ho = self.clip_head.linear_shortcut(self.verb_classifier_ho)
-        #self.verb_classifier_ho = F.normalize(self.verb_classifier_ho, p=2, dim=1)
-        self.verb_projection_ho = nn.Linear(4096, 117, bias=False)
-        self.verb_projection_ho.weight.data = self.verb_classifier_ho
-        for param in self.verb_projection_ho.parameters():
-            param.requires_grad = False
+        # self.verb_classifier_ho = torch.load("/home/taehoon/HOICLIP/training_linearshortcut/verb_classifier_weights_ho_7b.pt", "cpu").float()
+        # #self.verb_classifier_ho = self.clip_head.linear_shortcut(self.verb_classifier_ho)
+        # #self.verb_classifier_ho = F.normalize(self.verb_classifier_ho, p=2, dim=1)
+        # self.verb_projection_ho = nn.Linear(4096, 117, bias=False)
+        # self.verb_projection_ho.weight.data = self.verb_classifier_ho
+        # for param in self.verb_projection_ho.parameters():
+        #     param.requires_grad = False
     
         
-        self.text_2_queries = MLP(4096, 128, args.adapt_dim, 2)
-        self.ho_llava_2_queries = nn.Linear(4096, args.adapt_dim, bias = False)
-        self.h_llava_2_queries = nn.Linear(4096, args.adapt_dim, bias = False)
-        self.o_llava_2_queries = nn.Linear(4096, args.adapt_dim, bias = False)
-        self.ho_query_proj = MLP(512, 128, args.adapt_dim, 2)
-        self.h_query_proj = MLP(256, 128, args.adapt_dim, 2)
-        self.o_query_proj = MLP(256, 128, args.adapt_dim, 2)
-        self.ho_text_query_proj = MLP(args.adapt_dim*2, 128, args.adapt_dim, 2)
+        # self.text_2_queries = MLP(4096, 128, args.adapt_dim, 2)
+        # self.ho_llava_2_queries = nn.Linear(4096, args.adapt_dim, bias = False)
+        # self.h_llava_2_queries = nn.Linear(4096, args.adapt_dim, bias = False)
+        # self.o_llava_2_queries = nn.Linear(4096, args.adapt_dim, bias = False)
+        # self.ho_query_proj = MLP(512, 128, args.adapt_dim, 2)
+        # self.h_query_proj = MLP(256, 128, args.adapt_dim, 2)
+        # self.o_query_proj = MLP(256, 128, args.adapt_dim, 2)
+        # self.ho_text_query_proj = MLP(args.adapt_dim*2, 128, args.adapt_dim, 2)
 
         #self.alpha_logit = nn.Parameter(torch.tensor(0.0)) 
 
@@ -281,16 +281,16 @@ class HOILLAVA(nn.Module):
 
             
 
-            hidden_states = run_llava_model(
-                self.clip_head,
-                self.clip_head['model_name'],
-                image.decompose()[0][b_idx:b_idx + 1].half(),
-                (336,336),
-                self.clip_head['tokenizer'],
-                hidden_states=True,
-                text_prompt="."
-            )
-            llava_features = hidden_states[self.args.layer].float()
+            # hidden_states = run_llava_model(
+            #     self.clip_head,
+            #     self.clip_head['model_name'],
+            #     image.decompose()[0][b_idx:b_idx + 1].half(),
+            #     (336,336),
+            #     self.clip_head['tokenizer'],
+            #     hidden_states=True,
+            #     text_prompt="."
+            # )
+            # llava_features = hidden_states[self.args.layer].float()
             # import pdb; pdb.set_trace()
 
 
@@ -336,19 +336,33 @@ class HOILLAVA(nn.Module):
                                         #for (verb_idx, object_idx), text in hico_text_label.hico_text_label.items()
                                         #if object_idx == obj_idx]
 
-            objects = labels[y_keep]
-            candidate_texts_per_pair = []
+            gt_bx_h = self.recover_boxes(targets[0]['boxes_h'], targets[0]['size'])
+            gt_bx_o = self.recover_boxes(targets[0]['boxes_o'], targets[0]['size'])
+            
+            objects = labels[y_keep].unique()
+            #
+            #objects = targets[0]["object"]
+            #import pdb; pdb.set_trace(#)
+            candidate_texts = []
             for obj_idx in objects.cpu().tolist():
-                # Get full candidates and strip "a photo of a " prefix
-                candidates = [text.replace("a photo of a ", "") 
-                            for (verb_idx, object_idx), text in hico_text_label.hico_text_label.items() 
-                            if object_idx == obj_idx]
-                candidate_texts_per_pair.append(candidates)
+                candidates = [
+                    ((verb_idx, object_idx), text.replace("a photo of a ", ""))
+                    for (verb_idx, object_idx), text in hico_text_label.hico_text_label.items()
+                    if object_idx == obj_idx
+                ]
+                candidate_texts.extend(candidates)
+            candidate_texts = list(dict.fromkeys(candidate_texts))
             #import pdb; pdb.set_trace()
-            bbox_2_tokens = bbox_to_token((336,336),boxes, 24)
-            bool_h = bbox_2_tokens[x_keep]
-            bool_o = bbox_2_tokens[y_keep]
-            bool_union = bool_h | bool_o
+            # bbox_2_tokens = bbox_to_token((336,336),boxes, 24)
+            # bbox_2_tokens_h = bbox_to_token((336,336),gt_bx_h, 24)
+            # bbox_2_tokens_o = bbox_to_token((336,336),gt_bx_o, 24)
+            # bool_h = bbox_2_tokens_h 
+            # bool_o = bbox_2_tokens_o
+            #bool_union = bool_h | bool_o
+            #bool_intersection = bool_h & bool_o
+            #bool_h = bbox_2_tokens[x_keep]
+            #bool_o = bbox_2_tokens[y_keep]
+            #bool_union = bool_h | bool_o
 
             # llama_modify(
             #     self.clip_head['model'],
@@ -367,97 +381,97 @@ class HOILLAVA(nn.Module):
             #import pdb; pdb.set_trace()
 
             results_per_object = []
-            for i in range(bool_union.shape[0]):
-                llama_modify(
-                    self.clip_head['model'],
-                    15,
-                    24,
-                    True,
-                    0.2,
-                    False,
-                    img_start_idx,
-                    img_end_idx,
-                    bool_union[i],
-                    prefix_prompt_end_idx
+            # for i in range(bool_o.shape[0]):
+                # llama_modify(
+                #     self.clip_head['model'],
+                #     2,
+                #     32,
+                #     True,
+                #     0.2,
+                #     False,
+                #     img_start_idx,
+                #     img_end_idx,
+                #     bool_union[i],
+                #     prefix_prompt_end_idx
+                # )
+            for candidates in candidate_texts:
+                #import pdb; pdb.set_trace()
+                log_probs, probs = compute_conditional_likelihood_llava(
+                    self.clip_head,
+                    self.clip_head['model_name'],
+                    image.decompose()[0][b_idx:b_idx + 1].half(),
+                    (336,336),
+                    self.clip_head['tokenizer'],
+                    "Provide the correct human-object interaction in the image: a photo of a ",
+                    candidates[-1],   # Now just ["person boarding an airplane", "person directing an airplane", ...]
                 )
-                for candidates in candidate_texts_per_pair[i]:
-                    #import pdb; pdb.set_trace()
-                    log_probs, probs = compute_conditional_likelihood_llava(
-                        self.clip_head,
-                        self.clip_head['model_name'],
-                        image.decompose()[0][b_idx:b_idx + 1].half(),
-                        (336,336),
-                        self.clip_head['tokenizer'],
-                        "Provide the correct human-object interaction in the image: a photo of a ",
-                        candidates,   # Now just ["person boarding an airplane", "person directing an airplane", ...]
-                    )
 
-                    # Save candidates with their probabilities
-                    results_per_object.append({
-                        'candidates': candidates,
-                        'probs': probs,
-                    })
+                # Save candidates with their probabilities
+                results_per_object.append({
+                    'candidates': candidates,
+                    'probs': probs,
+                })
 
             # Sort by probability (descending order)
             results_per_object_sorted = sorted(results_per_object, key=lambda x: x['probs'], reverse=True)
 
 
             #import pdb; pdb.set_trace()
+# attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
-
-            ho_detr_feats = self.ho_query_proj(torch.cat([feats[x_keep],feats[y_keep]],dim=-1))
-            h_detr_feats = self.h_query_proj(feats[h_unique_indices])
-            o_detr_feats = self.o_query_proj(feats[o_unique_indices])
+            # ho_detr_feats = self.ho_query_proj(torch.cat([feats[x_keep],feats[y_keep]],dim=-1))
+            # h_detr_feats = self.h_query_proj(feats[h_unique_indices])
+            # o_detr_feats = self.o_query_proj(feats[o_unique_indices])
            
-            text_2_query = self.text_2_queries(F.normalize(self.object_embedding.float(), 2, -1))
-            #ing_dir = self.text_2_queries(self.ing.to(device))
-            h_text = text_2_query[labels[h_unique_indices]] #+ ing_dir.unsqueeze(0)
-            o_text = text_2_query[labels[o_unique_indices]] #+ ing_dir.unsqueeze(0)
-            #ho_text = h_text[h_inverse_indices] + o_text[o_inverse_indices]
-            ho_text = self.ho_text_query_proj(torch.cat([h_text[h_inverse_indices],o_text[o_inverse_indices]],dim=-1)) #+ ing_dir.unsqueeze(0)
-            bbox_2_tokens = bbox_to_token((336,336),boxes, 24)
+            # text_2_query = self.text_2_queries(F.normalize(self.object_embedding.float(), 2, -1))
+            # #ing_dir = self.text_2_queries(self.ing.to(device))
+            # h_text = text_2_query[labels[h_unique_indices]] #+ ing_dir.unsqueeze(0)
+            # o_text = text_2_query[labels[o_unique_indices]] #+ ing_dir.unsqueeze(0)
+            # #ho_text = h_text[h_inverse_indices] + o_text[o_inverse_indices]
+            # ho_text = self.ho_text_query_proj(torch.cat([h_text[h_inverse_indices],o_text[o_inverse_indices]],dim=-1)) #+ ing_dir.unsqueeze(0)
+            # bbox_2_tokens = bbox_to_token((336,336),boxes, 24)
             x_boxes = boxes[x_keep]  # shape: (N, 4)
             y_boxes = boxes[y_keep]  # shape: (N, 4)
 
             # Union box: min of top-left corner, max of bottom-right corner
-            x1 = torch.min(x_boxes[:, 0], y_boxes[:, 0])
-            y1 = torch.min(x_boxes[:, 1], y_boxes[:, 1])
-            x2 = torch.max(x_boxes[:, 2], y_boxes[:, 2])
-            y2 = torch.max(x_boxes[:, 3], y_boxes[:, 3])
+            # x1 = torch.min(x_boxes[:, 0], y_boxes[:, 0])
+            # y1 = torch.min(x_boxes[:, 1], y_boxes[:, 1])
+            # x2 = torch.max(x_boxes[:, 2], y_boxes[:, 2])
+            # y2 = torch.max(x_boxes[:, 3], y_boxes[:, 3])
 
-            union_boxes = torch.stack([x1, y1, x2, y2], dim=1)  # shape: (N, 4)
-            union_tokens  = bbox_to_token((336,336),union_boxes, 24)
+            # union_boxes = torch.stack([x1, y1, x2, y2], dim=1)  # shape: (N, 4)
+            # union_tokens  = bbox_to_token((336,336),union_boxes, 24)
 
             
+            #import pdb; pdb.set_trace()
+            ## boxes_xyxy = boxes[h_unique_indices]  # shape [K, 4]
+            # batch_indices = torch.zeros((boxes_xyxy.size(0),), dtype=torch.long, device=boxes_xyxy.device)  # shape [K]
+            # roi_boxes = torch.cat([batch_indices[:, None].float(), boxes_xyxy], dim=1)  # shape [K, 5]
 
-            boxes_xyxy = boxes[h_unique_indices]  # shape [K, 4]
-            batch_indices = torch.zeros((boxes_xyxy.size(0),), dtype=torch.long, device=boxes_xyxy.device)  # shape [K]
-            roi_boxes = torch.cat([batch_indices[:, None].float(), boxes_xyxy], dim=1)  # shape [K, 5]
-
-            boxes_xyxy1 = boxes[o_unique_indices]  # shape [K, 4]
-            batch_indices1 = torch.zeros((boxes_xyxy1.size(0),), dtype=torch.long, device=boxes_xyxy1.device)  # shape [K]
-            roi_boxes1 = torch.cat([batch_indices1[:, None].float(), boxes_xyxy1], dim=1)  # shape [K, 5]
-
-
-            boxes_xyxy2 = union_boxes  # shape [K, 4]
-            batch_indices2 = torch.zeros((boxes_xyxy2.size(0),), dtype=torch.long, device=boxes_xyxy2.device)  # shape [K]
-            roi_boxes2 = torch.cat([batch_indices2[:, None].float(), boxes_xyxy2], dim=1)  # shape [K, 5]
+            # boxes_xyxy1 = boxes[o_unique_indices]  # shape [K, 4]
+            # batch_indices1 = torch.zeros((boxes_xyxy1.size(0),), dtype=torch.long, device=boxes_xyxy1.device)  # shape [K]
+            # roi_boxes1 = torch.cat([batch_indices1[:, None].float(), boxes_xyxy1], dim=1)  # shape [K, 5]
 
 
-            h_feats0 = torchvision.ops.roi_align(llava_features.view(1, 24, 24, 4096).permute(0, 3, 1, 2),  roi_boxes,
-                                                    output_size=(7, 7),
-                                                    spatial_scale=24 / 336, aligned=True)
-            o_feats0 = torchvision.ops.roi_align(llava_features.view(1, 24, 24, 4096).permute(0, 3, 1, 2),  roi_boxes1,
-                                                    output_size=(7, 7),
-                                                    spatial_scale=24 / 336, aligned=True)
+            # boxes_xyxy2 = union_boxes  # shape [K, 4]
+            # batch_indices2 = torch.zeros((boxes_xyxy2.size(0),), dtype=torch.long, device=boxes_xyxy2.device)  # shape [K]
+            # roi_boxes2 = torch.cat([batch_indices2[:, None].float(), boxes_xyxy2], dim=1)  # shape [K, 5]
 
-            ho_feats0 = torchvision.ops.roi_align(llava_features.view(1, 24, 24, 4096).permute(0, 3, 1, 2), roi_boxes2,
-                                                    output_size=(7, 7),
-                                                    spatial_scale=24 / 336, aligned=True)
 
-            ho_feats0 = ho_feats0.flatten(2).mean(-1)
-            h_feats0 = h_feats0.flatten(2).mean(-1)
-            o_feats0 = o_feats0.flatten(2).mean(-1)
+            # h_feats0 = torchvision.ops.roi_align(llava_features.view(1, 24, 24, 4096).permute(0, 3, 1, 2),  roi_boxes,
+            #                                         output_size=(7, 7),
+            #                                         spatial_scale=24 / 336, aligned=True)
+            # o_feats0 = torchvision.ops.roi_align(llava_features.view(1, 24, 24, 4096).permute(0, 3, 1, 2),  roi_boxes1,
+            #                                         output_size=(7, 7),
+            #                                         spatial_scale=24 / 336, aligned=True)
+
+            # ho_feats0 = torchvision.ops.roi_align(llava_features.view(1, 24, 24, 4096).permute(0, 3, 1, 2), roi_boxes2,
+            #                                         output_size=(7, 7),
+            #                                         spatial_scale=24 / 336, aligned=True)
+
+            # ho_feats0 = ho_feats0.flatten(2).mean(-1)
+            # h_feats0 = h_feats0.flatten(2).mean(-1)
+            # o_feats0 = o_feats0.flatten(2).mean(-1)
             # if self.args.cls_token:
             #     h_feats1 = self.h_llava_2_queries(h_feats0 + last_hidden_states[30].float())
             #     o_feats1 = self.o_llava_2_queries(o_feats0 + last_hidden_states[30].float())
@@ -473,12 +487,36 @@ class HOILLAVA(nn.Module):
             # ho_tokens, _ = self.ho_steer(ho_feats1, ho_detr_feats, union_boxes, targets[b_idx]['size'], llava_features, ho_text)
             #self.verb_projection_ho(ho_tokens + torch.sigmoid(self.ho_alpha_logit) * ho_feats0)
             #import pdb; pdb.set_trace()
-            ho_logits = self.verb_projection_ho(ho_feats0) #+ torch.sigmoid(self.ho_alpha_logit) * ho_feats0) #/ math.sqrt(4096)
-            h_logits = self.verb_projection_ho(h_feats0) #+ torch.sigmoid(self.h_alpha_logit) * h_feats0) #/ math.sqrt(4096)
-            o_logits = self.verb_projection_ho(o_feats0) #+ torch.sigmoid(self.o_alpha_logit) * o_feats0) #/ math.sqrt(4096)
-            
+            # ho_logits = self.verb_projection_ho(ho_feats0) #+ torch.sigmoid(self.ho_alpha_logit) * ho_feats0) #/ math.sqrt(4096)
+            # h_logits = self.verb_projection_ho(h_feats0) #+ torch.sigmoid(self.h_alpha_logit) * h_feats0) #/ math.sqrt(4096)
+            # o_logits = self.verb_projection_ho(o_feats0) #+ torch.sigmoid(self.o_alpha_logit) * o_feats0) #/ math.sqrt(4096)
 
-            logits = ho_logits
+
+            obj_verb_to_score = defaultdict(float)
+
+            for r in results_per_object_sorted:
+                (verb_idx, obj_idx), _ = r['candidates']
+                score = r['probs'][0]
+
+                # keep max if duplicated
+                key = (obj_idx, verb_idx)
+                obj_verb_to_score[key] = max(obj_verb_to_score[key], score)
+            obj_labels = labels[y_keep]          # [N]
+            N = obj_labels.shape[0]
+            num_verbs = 117
+
+            final_logits = torch.zeros(
+                (N, num_verbs),
+                device=obj_labels.device
+            )
+
+            for i, obj in enumerate(obj_labels.tolist()):
+                for verb_idx in range(num_verbs):
+                    final_logits[i, verb_idx] = obj_verb_to_score.get(
+                        (obj, verb_idx), 0.0
+                    )
+            #import pdb; pdb.set_trace()
+            logits = final_logits
 
         
             boxes_h_collated.append(x_keep)
@@ -488,7 +526,7 @@ class HOILLAVA(nn.Module):
                 x_keep, y_keep, scores, labels)
             )
             all_logits_collated.append(logits)
-            import pdb; pdb.set_trace()
+            #import pdb; pdb.set_trace()
 
         return all_logits_collated, prior_collated, boxes_h_collated, boxes_o_collated, object_class_collated
 
@@ -675,8 +713,10 @@ class HOILLAVA(nn.Module):
         ):
             pr = pr.prod(0)
             x, y = torch.nonzero(pr).unbind(1)
-            scores = torch.sigmoid(lg[x, y])
-
+            #this is for logits
+            # scores = torch.sigmoid(lg[x, y])
+            scores = lg[x, y]
+            #import pdb; pdb.set_trace()
             detections.append(dict(
                 boxes=bx, pairing=torch.stack([h[x], o[x]]),
                 scores=scores * pr[x, y], labels=y,

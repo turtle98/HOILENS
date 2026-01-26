@@ -6,7 +6,7 @@ gpu_num=1
 WANDB__SERVICE_WAIT=300
 
 CUDA_VISIBLE_DEVICES=6 torchrun --rdzv_id $id --rdzv_backend=c10d --nproc_per_node=$gpu_num --rdzv_endpoint=127.0.0.1:$port \
-         main_llava_training.py --pretrained checkpoints/pretrained_detr/detr-r50-hicodet.pth --clip_dir_vit checkpoints/pretrained_clip/ViT-L-14-336px.pt --output-dir /home/taehoon/HOILENS/checkpoints/ECCV \
+         main_llava_training.py --pretrained checkpoints/pretrained_detr/detr-r50-hicodet.pth --clip_dir_vit checkpoints/pretrained_clip/ViT-L-14-336px.pt --output-dir /home/taehoon/HOILENS/checkpoints/ECCV/zeroshot_noattnmod_loglikelihood \
          --dataset hicodet --zs --zs_type non_rare_first --num_classes 117 --num-workers 4 \
          --epochs 10 --lr-head 1e-4 --lr-drop 5 \
          --adapt_dim 128 --batch-size 1 \

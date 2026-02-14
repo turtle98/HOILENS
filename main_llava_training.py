@@ -16,8 +16,9 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
 #import wandb
 from thop import profile
-from models.ours_llava import build_detector
+from models.ours_llava_new_lora import build_detector
 from utils.args import get_args
+import datetime
 
 from engine import CustomisedDLE
 from datasets import DataFactory, custom_collate
@@ -46,7 +47,8 @@ def main(rank, args):
         backend="nccl",
         init_method="env://",
         world_size=args.world_size,
-        rank=rank
+        rank=rank,
+        timeout=datetime.timedelta(minutes=30)
     )
     seed = args.seed + dist.get_rank()
     torch.manual_seed(seed)
@@ -70,8 +72,12 @@ def main(rank, args):
     trainset = DataFactory(name=args.dataset, partition=args.partitions[0], data_root=args.data_root,
                            clip_model_name=args.clip_model_name, zero_shot=args.zs, zs_type=args.zs_type,
                            num_classes=args.num_classes, args=args)
-    testset = DataFactory(name=args.dataset, partition=args.partitions[1], data_root=args.data_root,
-                          clip_model_name=args.clip_model_name, args=args)
+    if args.few_shot:
+        testset = DataFactory(name=args.dataset, partition=args.partitions[0], data_root=args.data_root,
+                            clip_model_name=args.clip_model_name, args=args)
+    else:
+        testset = DataFactory(name=args.dataset, partition=args.partitions[1], data_root=args.data_root,
+                            clip_model_name=args.clip_model_name, args=args)
 
     train_sampler = DistributedSampler(trainset, num_replicas=args.world_size, rank=rank)
     test_sampler = DistributedSampler(testset, shuffle=False, drop_last=False)
@@ -94,7 +100,7 @@ def main(rank, args):
     object_n_verb_to_interaction = trainset.dataset.object_n_verb_to_interaction
     object_to_target = trainset.dataset.object_class_to_target_class
 
-
+   # import pdb; pdb.set_trace()
     print('[INFO]: num_classes', args.num_classes)
     ###added rank 
     lain = build_detector(args, object_to_target, object_n_verb_to_interaction=object_n_verb_to_interaction, clip_model_path=args.clip_dir_vit, rank = rank)
@@ -105,7 +111,7 @@ def main(rank, args):
     if os.path.exists(args.resume):
         print(f"===>>> Rank {rank}: continue from saved checkpoint {args.resume}")
         checkpoint = torch.load(args.resume, map_location='cpu')
-        lain.load_state_dict(checkpoint['model_state_dict'],strict=True)
+        lain.load_state_dict(checkpoint['model_state_dict'],strict=False)
     else:
         print(f"=> Rank {rank}: start from a randomly initialised model")
 
@@ -222,13 +228,14 @@ def main(rank, args):
 
 
     param_dicts = [
-        # {
-        #     "params": [p for n, p in lain.clip_head.named_parameters()
-        #             if p.requires_grad]
-        # },
+        { ## lora layers
+            "params": [p for n, p in lain.named_parameters()
+                    if p.requires_grad and 'lora_' in n],
+            "lr": args.lr_lora,
+        },
         { ## others
             "params": [p for n, p in lain.named_parameters()
-                    if p.requires_grad and 'clip_head' not in n],
+                    if p.requires_grad and 'lora_' not in n],
             "lr": args.lr_head,
         },
     ]

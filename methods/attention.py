@@ -15,6 +15,7 @@ def llama_new_forward(
     past_key_value: Optional[Tuple[torch.Tensor]] = None,
     output_attentions: bool = False,
     use_cache: bool = False,
+    **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
     bsz, q_len, _ = hidden_states.size()
 
@@ -64,6 +65,15 @@ def llama_new_forward(
             f" {attn_weights.size()}"
         )
 
+
+    # Create causal mask: 0 for lower triangle (can attend), -inf for upper triangle (cannot attend)
+    # if attention_mask is None:
+    #     attention_mask = torch.zeros(bsz, 1, q_len, kv_seq_len, device=hidden_states.device)
+    #     attention_mask.masked_fill_(
+    #         torch.triu(torch.ones(q_len, kv_seq_len, dtype=torch.bool, device=hidden_states.device), diagonal=1).unsqueeze(0).unsqueeze(0),
+    #         float('-inf')
+    #     )
+
     if attention_mask is not None:
         if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
             raise ValueError(
@@ -73,6 +83,7 @@ def llama_new_forward(
         attn_weights = torch.max(
             attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min)
         )
+    #import pdb; pdb.set_trace()
 
     ### PAI's modification
     if hasattr(self, "use_attn"):
@@ -80,7 +91,10 @@ def llama_new_forward(
         img_start_idx = self.img_start_idx
         img_end_idx = self.img_end_idx
         bbox_mask = self.bbox_mask if hasattr(self, "bbox_mask") else None
+        bbox_mask_h = self.bbox_mask_h if hasattr(self, "bbox_mask_h") else None
+        bbox_mask_o = self.bbox_mask_o if hasattr(self, "bbox_mask_o") else None
         target_text_idx = self.target_text_idx if hasattr(self, "target_text_idx") else None
+        focus = self.focus if hasattr(self, "focus") else False
     else:
         use_attn = False
 
@@ -88,43 +102,61 @@ def llama_new_forward(
         use_cfg = self.use_cfg
     else:
         use_cfg = False
+        #  start_idx = 28-12
+        # if self.layer_idx >= start_idx:
+        #     # query_states = torch.cat([query_states[:, :image_token_positions+1], query_states[:, image_token_positions+image_token_lengths-1:]], dim=1)
+        #     key_states = torch.cat([key_states[:, :image_token_positions+1], key_states[:, image_token_positions+image_token_lengths-1:]], dim=1)
+        #     value_states = torch.cat([value_states[:, :image_token_positions+1], value_states[:, image_token_positions+image_token_lengths-1:]], dim=1)
+        #     attention_mask = torch.cat([attention_mask[:, :image_token_positions+1], attention_mask[:, image_token_positions+image_token_lengths-1:]], dim=1) if attention_mask is not None else None
+    if use_attn:
+        if bbox_mask_h != None:
+            img_attn = attn_weights[:, :, img_start_idx:img_end_idx, img_start_idx:img_end_idx]   # [bsz, num_heads, 576]
+            #img_attn = attn_weights[:, :, img_end_idx+1:, img_start_idx:img_end_idx]  # [bsz, num_heads, 576]
+            #import pdb; pdb.set_trace()
 
-  
-        if bbox_mask is not None:
-            # Apply attention boost only to bounding box regions
-            # bbox_mask shape: [576] - boolean mask for image tokens
-            #import pdb; pdb.set_trace()
-            # img_attn = attn_weights[:, :, img_start_idx:img_end_idx, img_start_idx:img_end_idx]  # [bsz, num_heads, 576]
-            # # img[:, :, bbox_mask, bbox_mask] = (
-            # # img[:, :, bbox_mask, bbox_mask] + self.alpha
-            # # #+ img[:, :, bbox_mask, bbox_mask]
-            # # )
-            # img_attn[:, :, :, bbox_mask] = (
-            #     img_attn[:, :, :, bbox_mask].abs() * self.alpha
-            #     + img_attn[:, :, :, bbox_mask]
-            # )
-            # attn_weights[:, :, img_start_idx:img_end_idx, img_start_idx:img_end_idx] = img_attn
-            img_attn = attn_weights[:, :, target_text_idx-1:, img_start_idx:img_end_idx]  # [bsz, num_heads, 576]
-            #import pdb; pdb.set_trace()
-            # img_attn[:, :, :, bbox_mask] = (
-            #     img_attn[:, :, :, bbox_mask].abs() * self.alpha
-            #     + img_attn[:, :, :, bbox_mask]
-            # )
+
+            cross =  bbox_mask_h[:, None] &  bbox_mask_o[None, :]      # bool [576, 576]  (H rows × O cols)
+            sym   = cross | cross.T              # also mask O->H
+
+
+            m = sym[None, None, :, :]                              # [1,1,576,576] -> broadcast
+            boosted = img_attn.abs() * self.alpha + img_attn        # same boost rule you used
+            img_attn = torch.where(m, boosted, img_attn)
+            
+            
+            # img_attn.masked_fill_(sym[None, None, :, :], -float("inf"))
+
 
             # hard masking
-            img_attn[:, :, :, ~bbox_mask] = -float("inf")
+            #img_attn[:, :, :, ~bbox_mask] = -float("inf")
             #import pdb; pdb.set_trace()
-            attn_weights[:, :, target_text_idx-1:, img_start_idx:img_end_idx] = img_attn
-        else:
-            # Original behavior: boost all image tokens
-            attn_weights[:, :, target_text_idx-1:, img_start_idx:img_end_idx] = (
-                attn_weights[:, :, target_text_idx-1:, img_start_idx:img_end_idx].abs() * self.alpha
-                + attn_weights[:, :, target_text_idx-1:, img_start_idx:img_end_idx]
-            )
+           # import pdb; pdb.set_trace()
+            attn_weights[:, :, img_start_idx:img_end_idx, img_start_idx:img_end_idx] = img_attn
 
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
-        query_states.dtype
-    )
+        elif bbox_mask != None:
+            img_attn = attn_weights[:, :, img_start_idx+1:, img_start_idx:img_end_idx]   # [bsz, num_heads, 576]
+            if focus:
+                img_attn[:, :, :, ~bbox_mask] = -float("inf")
+            else:
+                img_attn[:, :, :, bbox_mask] = -float("inf")
+                #import pdb; pdb.set_trace()
+
+        #       start_idx = 36-4
+        # if self.layer_idx >= start_idx:
+        #     # query_states = torch.cat([query_states[:, :image_token_positions+1], query_states[:, image_token_positions+image_token_lengths-1:]], dim=1)
+        #     key_states = torch.cat([key_states[:, :image_token_positions+1], key_states[:, image_token_positions+image_token_lengths-1:]], dim=1)
+        #     value_states = torch.cat([value_states[:, :image_token_positions+1], value_states[:, image_token_positions+image_token_lengths-1:]], dim=1)
+        #     attention_mask = torch.cat([attention_mask[:, :image_token_positions+1], attention_mask[:, image_token_positions+image_token_lengths-1:]], dim=1) if attention_mask is not None else None
+
+            attn_weights[:, :, img_start_idx+1:, img_start_idx:img_end_idx] = img_attn
+        else:
+            #import pdb; pdb.set_trace()
+            attn_weights[:, :,img_start_idx+1:, img_start_idx:img_end_idx] = (
+                attn_weights[:, :, img_start_idx+1:, img_start_idx:img_end_idx].abs() * self.alpha
+                + attn_weights[:, :, img_start_idx+1:, img_start_idx:img_end_idx]
+            )
+    #import pdb; pdb.set_trace()
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
     attn_output = torch.matmul(attn_weights, value_states)
 
@@ -146,7 +178,7 @@ def llama_new_forward(
 
 
 def llama_modify(model, start_layer, end_layer, use_attn, alpha, use_cfg,
-                 img_start_idx, img_end_idx, bbox_mask, target_text_idx):
+                 img_start_idx, img_end_idx, bbox_mask, target_text_idx, bbox_mask_h, bbox_mask_o, focus):
     for i in range(start_layer, end_layer):
         model.model.layers[i].self_attn.use_attn = use_attn
         model.model.layers[i].self_attn.alpha = alpha
@@ -155,7 +187,11 @@ def llama_modify(model, start_layer, end_layer, use_attn, alpha, use_cfg,
         model.model.layers[i].self_attn.img_end_idx = img_end_idx
         model.model.layers[i].self_attn.target_text_idx = target_text_idx
         model.model.layers[i].self_attn.bbox_mask = bbox_mask
+        model.model.layers[i].self_attn.bbox_mask_h = bbox_mask_h
+        model.model.layers[i].self_attn.bbox_mask_o = bbox_mask_o
+        model.model.layers[i].self_attn.focus = focus
         model.model.layers[i].self_attn.forward = types.MethodType(llama_new_forward, model.model.layers[i].self_attn)
+
 
 # In attention.py
 # def llama_modify(model, start_layer, end_layer, use_attn, alpha, use_cfg,

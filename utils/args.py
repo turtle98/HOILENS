@@ -127,6 +127,7 @@ def get_args():
 
 
     parser.add_argument('--lr-head', default=1e-4, type=float)
+    parser.add_argument('--lr-lora', default=1e-4, type=float)
     parser.add_argument('--lr-vit', default=1e-4, type=float)
 
     parser.add_argument('--zs', action='store_true') ## zero-shot
@@ -194,5 +195,10 @@ def get_args():
     parser.add_argument('--vision_tower_name', default="openai/clip-vit-large-patch14-336")
     parser.add_argument('--zse', action='store_true', help='')
     parser.add_argument('--cse', action='store_true', help='')
+    parser.add_argument('--start_idx', default=5, type=int)
+    parser.add_argument('--end_idx', default=10, type=int)
+    parser.add_argument('--few_shot', action='store_true', help='')
+    parser.add_argument('--focus', action='store_true', help='')
+    parser.add_argument('--attn_mod', action='store_true', help='')
 
     return parser.parse_args()

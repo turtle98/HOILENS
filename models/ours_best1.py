@@ -48,7 +48,7 @@ from torchvision.ops.boxes import batched_nms, box_iou
 import numpy as np
 import torchvision 
 #import wandb
-
+import copy
 from utils.hico_list import hico_verbs_sentence
 from utils.vcoco_list import vcoco_verbs_sentence
 from utils.hico_utils import reserve_indices
@@ -184,6 +184,133 @@ class DecoderBlock(nn.Module):
         output = queries + self.dropout3(ffn_output)  # Residual
         return output
 
+
+
+class LoRALinear(nn.Module):
+    """LoRA adapter for a frozen linear layer."""
+    def __init__(self, in_features, out_features, rank=16, alpha=16):
+        super().__init__()
+        self.rank = rank
+        self.alpha = alpha
+        self.scaling = alpha / rank
+        
+        # Low-rank matrices
+        self.lora_A = nn.Linear(in_features, rank, bias=False)
+        self.lora_B = nn.Linear(rank, out_features, bias=False)
+        
+        # Initialize A with Kaiming, B with zeros
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+    
+    def forward(self, x, frozen_weight):
+        """
+        Args:
+            x: input tensor
+            frozen_weight: the frozen nn.Linear layer
+        """
+        # Frozen path: cast input to match frozen weight dtype (e.g., fp16)
+        frozen_dtype = frozen_weight.weight.dtype
+        frozen_out = frozen_weight(x.to(frozen_dtype))
+        # LoRA path: compute in fp32 for training stability, then cast back to frozen weight dtype
+        lora_out = self.lora_B(self.lora_A(x.float())).to(frozen_dtype) * self.scaling
+        return frozen_out + lora_out
+
+
+class CrossAttendWithLoRA(nn.Module):
+    """Cross-attention using cloned LLaMA layers with LoRA adapters."""
+    
+    def __init__(self, cloned_layers, lora_rank=16, lora_alpha=16):
+        super().__init__()
+        self.cloned_layers = cloned_layers
+        
+        # Freeze cloned layers
+        for layer in self.cloned_layers:
+            for param in layer.parameters():
+                param.requires_grad = False
+            # for param in layer.mlp.parameters():
+            #     param.requires_grad = True
+        
+        # Create LoRA adapters for each layer's attention
+        self.lora_q = nn.ModuleList()
+        self.lora_k = nn.ModuleList()
+        self.lora_v = nn.ModuleList()
+        self.lora_o = nn.ModuleList()
+        
+        for layer in cloned_layers:
+            hidden_size = layer.self_attn.q_proj.weight.shape[0]
+            self.lora_q.append(LoRALinear(hidden_size, hidden_size, lora_rank, lora_alpha))
+            self.lora_k.append(LoRALinear(hidden_size, hidden_size, lora_rank, lora_alpha))
+            self.lora_v.append(LoRALinear(hidden_size, hidden_size, lora_rank, lora_alpha))
+            self.lora_o.append(LoRALinear(hidden_size, hidden_size, lora_rank, lora_alpha))
+
+    def forward(self, queries, context, roi_mask=None, return_attn_weights=False):
+        hidden_states = queries
+        attn_weights_all = []
+
+        for idx, layer in enumerate(self.cloned_layers):
+            attn = layer.self_attn
+            bsz, q_len, _ = hidden_states.shape
+            kv_len = context.shape[1]
+
+            # Pre-norm and residual
+            residual = hidden_states
+            normed = layer.input_layernorm(hidden_states)
+            normed_kv = layer.input_layernorm(context)  # <-- ADD THIS: normalize context too
+
+            # Project with LoRA: frozen + low-rank adaptation
+            q = self.lora_q[idx](normed, attn.q_proj)
+            k = self.lora_k[idx](normed_kv, attn.k_proj)
+            v = self.lora_v[idx](normed_kv, attn.v_proj)
+
+            head_dim = attn.head_dim
+            num_heads = attn.num_heads
+
+            q = q.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
+            k = k.view(bsz, kv_len, num_heads, head_dim).transpose(1, 2)
+            v = v.view(bsz, kv_len, num_heads, head_dim).transpose(1, 2)
+
+            # Attention mask (must match q's dtype)
+            attn_mask = None
+            if roi_mask is not None:
+               attn_mask = torch.zeros_like(roi_mask, dtype=q.dtype)
+               attn_mask[~roi_mask] = float('-inf')
+               attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
+
+            if return_attn_weights:
+                # Manual attention to get weights
+                scale = head_dim ** -0.5
+                scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+                if attn_mask is not None:
+                    scores = scores + attn_mask
+                attn_w = F.softmax(scores, dim=-1)
+                attn_weights_all.append(attn_w)
+                attn_out = torch.matmul(attn_w, v)
+            else:
+                attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask)
+            
+            #import pdb; pdb.set_trace()
+
+            attn_out = attn_out.transpose(1, 2).contiguous().view(bsz, q_len, -1)
+
+            # Output projection with LoRA
+            attn_out = self.lora_o[idx](attn_out, attn.o_proj)
+
+            hidden_states = residual + attn_out
+
+            # FFN (frozen, no LoRA)
+            residual = hidden_states
+            hidden_states = layer.post_attention_layernorm(hidden_states)
+            hidden_states = hidden_states.to(layer.mlp.gate_proj.weight.dtype)
+            hidden_states = layer.mlp(hidden_states)
+            hidden_states = residual + hidden_states
+
+        if return_attn_weights:
+            return hidden_states, attn_out
+        return hidden_states
+
+
+
+
 class HOILLAVA(nn.Module):
     def __init__(self,
         args,
@@ -230,11 +357,6 @@ class HOILLAVA(nn.Module):
         self.dataset = args.dataset
         self.reserve_indices = reserve_indices
 
-        self.h_steer = verbsteer(in_dim=4096, out_dim=4096, rank=args.adapt_dim)
-        self.o_steer = verbsteer(in_dim=4096, out_dim=4096, rank=args.adapt_dim)
-        self.ho_steer = verbsteer(in_dim=4096, out_dim=4096, rank=args.adapt_dim)
-
-
         self.lm_head_embeddings = torch.load("/home/taehoon/HOICLIP/training_linearshortcut/lm_head_embedding_7b.pt", "cpu")
 
         self.verb_classifier_ho = torch.load("/home/taehoon/HOICLIP/training_linearshortcut/verb_classifier_weights_ho_7b.pt", "cpu").float()
@@ -244,20 +366,15 @@ class HOILLAVA(nn.Module):
         for param in self.verb_projection_ho.parameters():
             param.requires_grad = False
 
-        self.text_2_queries = MLP(4096, 128, args.adapt_dim, 2)#nn.Linear(4096, args.adapt_dim, bias = False)
-        self.ho_llava_2_queries = nn.Linear(4096, args.adapt_dim, bias = False)
-        self.h_llava_2_queries = nn.Linear(4096, args.adapt_dim, bias = False) #nn.Linear(4096, args.adapt_dim, bias = False)
-        self.o_llava_2_queries =nn.Linear(4096, args.adapt_dim, bias = False) #nn.Linear(4096, args.adapt_dim, bias = False)
-        self.ho_query_proj = MLP(512, 128, args.adapt_dim, 2)
-        self.h_query_proj = MLP(256, 128, args.adapt_dim, 2)
-        self.o_query_proj = MLP(256, 128, args.adapt_dim, 2)
-        self.ho_text_query_proj = MLP(args.adapt_dim*2, 128, args.adapt_dim, 2)
+        self.ho_query_proj = MLP(512, 128, 4096, 2)
+        self.h_query_proj = MLP(256, 128, 4096, 2)
+        self.o_query_proj = MLP(256, 128, 4096, 2)
 
         self.spatial_head = nn.Sequential(
             nn.Linear(36, 128), nn.ReLU(),
             nn.Linear(128, 256), nn.ReLU(),
-            nn.Linear(256, args.adapt_dim), nn.ReLU(),
-        ).to(torch.bfloat16)
+            nn.Linear(256, 4096), nn.ReLU(),
+        ).to(torch.float32)
 
         if self.num_classes == 117:
             verb_forms = [
@@ -429,6 +546,35 @@ class HOILLAVA(nn.Module):
             self.register_buffer('hoi_token_ids', hoi_padded)    # [600, max_hoi_tokens]
             self.register_buffer('hoi_token_mask', hoi_mask) 
 
+
+        start_layer = 31
+        num_layers = 1
+
+        cloned_layers_h = nn.ModuleList([
+            copy.deepcopy(self.clip_head["model"].model.layers[i])
+            for i in range(start_layer, start_layer + num_layers)
+        ])
+        self.cross_attend_lora_h = CrossAttendWithLoRA(cloned_layers_h, lora_rank=16, lora_alpha=16)
+
+        # Clone layers for O (object)
+        cloned_layers_o = nn.ModuleList([
+            copy.deepcopy(self.clip_head["model"].model.layers[i])
+            for i in range(start_layer, start_layer + num_layers)
+        ])
+        self.cross_attend_lora_o = CrossAttendWithLoRA(cloned_layers_o, lora_rank=16, lora_alpha=16)
+
+        #Clone layers for HO (human + object union)
+        cloned_layers_ho = nn.ModuleList([
+            copy.deepcopy(self.clip_head["model"].model.layers[i])
+            for i in range(start_layer, start_layer + num_layers)
+        ])
+        self.cross_attend_lora_ho = CrossAttendWithLoRA(cloned_layers_ho, lora_rank=16, lora_alpha=16)
+
+        final_norm = self.clip_head["model"].model.norm
+        self.final_norm = copy.deepcopy(final_norm)
+        for param in self.final_norm.parameters():
+            param.requires_grad = False
+
     def _reset_parameters(self):  ## xxx
         for p in self.context_aware.parameters():
             if p.dim() > 1:
@@ -531,7 +677,7 @@ class HOILLAVA(nn.Module):
 
             pairwise_spatial = compute_spatial_encodings(
                     [boxes[x.flatten()], ], [boxes[y.flatten()], ], [(336,336), ]
-            ).to(torch.bfloat16)
+            ).to(torch.float32)
             pairwise_spatial = self.spatial_head(pairwise_spatial)
             pairwise_spatial_reshaped = pairwise_spatial.reshape(n, n, -1)
             pairwise_spatial_reshaped = pairwise_spatial_reshaped[x_keep, y_keep]
@@ -548,10 +694,10 @@ class HOILLAVA(nn.Module):
 
 # pairwise_spatial_reshaped
 
-            text_2_query = self.text_2_queries(self.object_embedding)
-            h_text = text_2_query[labels[h_unique_indices]]
-            o_text = text_2_query[labels[o_unique_indices]]
-            ho_text = self.ho_text_query_proj(torch.cat([h_text[h_inverse_indices],o_text[o_inverse_indices]],dim=-1)) #+ ing_dir.unsqueeze(0)
+            #text_2_query = self.text_2_queries(self.object_embedding)
+            h_text = self.object_embedding[labels[h_unique_indices]]
+            o_text = self.object_embedding[labels[o_unique_indices]]
+            ho_text = self.object_embedding[labels[h_inverse_indices]] + self.object_embedding[labels[o_inverse_indices]]
            
             bbox_2_tokens = bbox_to_token((336,336),boxes, 24)
             x_boxes = boxes[x_keep]  # shape: (N, 4)
@@ -593,24 +739,24 @@ class HOILLAVA(nn.Module):
             h_feats0 = h_feats0.flatten(2).mean(-1)
             o_feats0 = o_feats0.flatten(2).mean(-1)
 
-
-            h_feats1 = self.h_llava_2_queries(h_feats0)
-            o_feats1 = self.o_llava_2_queries(o_feats0)
-            ho_feats1 = self.ho_llava_2_queries(ho_feats0)
-
-
-            h_tokens , _ = self.h_steer(h_feats1, h_detr_feats, boxes[h_unique_indices], targets[b_idx]['size'], hidden_states.float(), h_text)
-            o_tokens , _ = self.o_steer(o_feats1, o_detr_feats, boxes[o_unique_indices], targets[b_idx]['size'], hidden_states.float(), o_text) 
-            ho_tokens, _ = self.ho_steer(ho_feats1, ho_detr_feats + pairwise_spatial_reshaped, union_boxes, targets[b_idx]['size'], hidden_states.float(), ho_text)
+            bool_o_inverse = bbox_2_tokens[o_inverse_indices]  # [num_unique_o, 576]
+            bool_h_inverse = bbox_2_tokens[h_inverse_indices]  # [num_unique_o, 576]
+           # import pdb; pdb.set_trace()
+            h_feats0 = h_feats0[h_inverse_indices].unsqueeze(0)
+            o_feats0 = o_feats0[o_inverse_indices].unsqueeze(0)
 
 
+            h_out  = self.cross_attend_lora_h(h_detr_feats[h_inverse_indices].unsqueeze(0), llava_features, ) 
+            o_out = self.cross_attend_lora_o(o_detr_feats[o_inverse_indices].unsqueeze(0), llava_features, ) 
+            ho_out = self.cross_attend_lora_o(ho_detr_feats.unsqueeze(0) + pairwise_spatial_reshaped.unsqueeze(0), llava_features, ) 
+            #qimport pdb; pdb.set_trace()
             # ho_logits = self.verb_projection_ho(ho_tokens) #/ math.sqrt(4096)
             # h_logits = self.verb_projection_ho(h_tokens) #/ math.sqrt(4096)
             # o_logits = self.verb_projection_ho(o_tokens) #/ math.sqrt(4096)
 
-            normed_h = h_tokens.squeeze(0) + h_feats0# - lm_head_t.mean(1, keepdim=True).T #+ self.object_embedding[labels[h_inverse_indices]].to(torch.bfloat16) # [N, 4096]+ self.object_embedding[labels[h_inverse_indices]].to(torch.bfloat16)
-            normed_o = o_tokens.squeeze(0) + o_feats0#- lm_head_t.mean(1, keepdim=True).T
-            normed_ho = ho_tokens.squeeze(0) + ho_feats0# 
+            normed_h = self.final_norm(h_out.squeeze(0)) + h_feats0.squeeze(0)# - lm_head_t.mean(1, keepdim=True).T #+ self.object_embedding[labels[h_inverse_indices]].to(torch.bfloat16) # [N, 4096]+ self.object_embedding[labels[h_inverse_indices]].to(torch.bfloat16)
+            normed_o = self.final_norm(o_out.squeeze(0)) + o_feats0.squeeze(0)#- lm_head_t.mealon(1, keepdim=True).T
+            normed_ho = self.final_norm(ho_out.squeeze(0)) + ho_feats0# 
 
             # F.normalize(o_tokens.squeeze(0), dim= -1 ) @ F.normalize(o_tokens.squeeze(0), dim= -1 ).T
             # normed_h = h_feats0# - lm_head_t.mean(1, keepdim=True).T #+ self.object_embedding[labels[h_inverse_indices]].to(torch.bfloat16) # [N, 4096]+ self.object_embedding[labels[h_inverse_indices]].to(torch.bfloat16)
@@ -618,15 +764,10 @@ class HOILLAVA(nn.Module):
             # normed_ho = ho_feats0# 
 
             lm_head_t = self.lm_head_embeddings.T.to(hidden_states.device).float().detach() 
-            #centered_lm_head = lm_head_t #- lm_head_t.mean(1, keepdim=True)
-    
-            h_vocab = normed_h @ lm_head_t
-
-            o_vocab = normed_o @ lm_head_t
-
-            ho_vocab = (normed_ho) @ lm_head_t
-
-           # ho_vocab1 = (llava_features) @ lm_head_t
+            centered_lm_head = lm_head_t #- lm_head_t.mean(1, keepdim=True)
+            h_vocab = normed_h @ centered_lm_head
+            o_vocab = normed_o @ centered_lm_head
+            ho_vocab = (normed_ho) @ centered_lm_head
             #diffs_h = torch.log(1 + torch.sigmoid(topk_vocab.unsqueeze(2) - logits_h.unsqueeze(1)).sum(1)) / log_v
             # diffs = torch.empty_like(logits_ho)
             # if self.num_classes == 117:
@@ -665,10 +806,9 @@ class HOILLAVA(nn.Module):
 
             # w_ho = 1.0 / (1.0 + entropy_ho)'
 
-            topk_ho_vocab = torch.topk(ho_vocab, k=256, dim=-1).values
-            topk_h_vocab = torch.topk(h_vocab, k=256, dim=-1).values
-            topk_o_vocab = torch.topk(o_vocab, k=256, dim=-1).values
-            #topk_ho_vocab1 = torch.topk(ho_vocab1, k=512, dim=-1).values
+            topk_ho_vocab = torch.topk(ho_vocab, k=1024, dim=-1).values
+            topk_h_vocab = torch.topk(h_vocab, k=1024, dim=-1).values
+            topk_o_vocab = torch.topk(o_vocab, k=1024, dim=-1).values
             # probs_dist_ho = F.softmax(topk_ho_vocab, dim=-1)
             # entropy_ho = -(probs_dist_ho * torch.log(probs_dist_ho + 1e-10)).sum(dim=-1) 
             # probs_dist_h = F.softmax(topk_h_vocab , dim=-1)
@@ -683,14 +823,11 @@ class HOILLAVA(nn.Module):
             # confidence_ho = torch.exp(-entropy_ho)
             # confidence_o = torch.exp(-entropy_o)
 
-            #logits_ho = torch.sigmoid(((self.verb_projection_ho(normed_ho).unsqueeze(-1) - topk_ho_vocab.unsqueeze(1))) / topk_ho_vocab.mean(-1, keepdim=True).unsqueeze(-1)).mean(-1) 
-            #logits_h = torch.sigmoid((self.verb_projection_ho(normed_h).unsqueeze(-1)  - topk_h_vocab.unsqueeze(1))/ topk_h_vocab.mean(-1, keepdim=True).unsqueeze(-1)).mean(-1) 
-            #logits_o = torch.sigmoid((self.verb_projection_ho(normed_o).unsqueeze(-1)  - topk_o_vocab.unsqueeze(1))/ topk_o_vocab.mean(-1, keepdim=True).unsqueeze(-1)).mean(-1) 
+           # import pdb; pdb.set_trace()
+            logits_ho = torch.sigmoid(self.verb_projection_ho(normed_ho).unsqueeze(-1) - topk_ho_vocab.unsqueeze(1)).mean(-1) #-  #- normed_ho @ self.mu.T #- global_logit
+            logits_h = torch.sigmoid(self.verb_projection_ho(normed_h).unsqueeze(-1)  - topk_h_vocab.unsqueeze(1)).mean(-1) #torch.log(torch.sigmoid(self.verb_projection_ho(normed_h).unsqueeze(-1) - topk_h_vocab.unsqueeze(1)).sum(-1)) / torch.log(torch.tensor(100.0)) #-  #- normed_ho @ self.mu.T #- global_logit #- normed_h @ self.mu.T  #- global_logit
+            logits_o = torch.sigmoid(self.verb_projection_ho(normed_o).unsqueeze(-1)  - topk_o_vocab.unsqueeze(1)).mean(-1) #torch.log(torch.sigmoid(self.verb_projection_ho(normed_o).unsqueeze(-1) - topk_o_vocab.unsqueeze(1)).sum(-1)) / torch.log(torch.tensor(100.0)) #-  #- normed_ho @ self.mu.T #- global_logit #- normed_o @ self.mu.T #- global_logitb.unsqueeze(1)).mean(-1) #torch.log(torch.sigmoid(self.verb_projection_ho(normed_o).unsqueeze(-1) - topk_o_vocab.unsqueeze(1)).sum(-1)) / torch.log(torch.tensor(100.0)) #-  #- normed_ho @ self.mu.T #- global_logit #- normed_o @ self.mu.T #- global_logit
 
-
-            logits_ho = torch.sigmoid(((self.verb_projection_ho(normed_ho).unsqueeze(-1) - topk_ho_vocab.unsqueeze(1)))).mean(-1) 
-            logits_h = torch.sigmoid((self.verb_projection_ho(normed_h).unsqueeze(-1)  - topk_h_vocab.unsqueeze(1))).mean(-1) 
-            logits_o = torch.sigmoid((self.verb_projection_ho(normed_o).unsqueeze(-1)  - topk_o_vocab.unsqueeze(1))).mean(-1) 
             # logits_ho = 1 - diffs_ho
             # logits_o = 1 - diffs_o
             # logits_h = 1 - diffs_h #+ logits_h[h_inverse_indices] + logits_o[o_inverse_indices]) /3
@@ -698,10 +835,10 @@ class HOILLAVA(nn.Module):
             logits = (logits_h[h_inverse_indices] + logits_o[o_inverse_indices] + logits_ho)/3
 
             #logits = (ho_logits + h_logits[h_inverse_indices] + o_logits[o_inverse_indices])/3
-
-            #asd = o_tokens @  self.lm_head_embeddings.T.to(hidden_states.device)
-            #print(self.clip_head['tokenizer'].decode(torch.topk(ho_vocab[7], 100, dim=-1)[1]))
-            #print(self.clip_head['tokenizer'].decode(torch.topk(asd[5], 10, dim=-1)[1]))
+            #asd = h_out @  self.lm_head_embeddings.T.to(hidden_states.device)
+            #print(self.clip_head['tokenizer'].decode(torch.topk(ho_vocab[1], 100, dim=-1)[1]))
+            #print(self.clip_head['tokenizer'].decode(torch.topk(asd[0][0], 10, dim=-1)[1]))
+            
             boxes_h_collated.append(x_keep)
             boxes_o_collated.append(y_keep)
             object_class_collated.append(labels[y_keep])

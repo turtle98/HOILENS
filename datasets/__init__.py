@@ -39,12 +39,20 @@ class DataFactory(Dataset):
         if name == 'hicodet':
             assert partition in ['train2015', 'test2015'], \
                 "Unknown HICO-DET partition " + partition
-            self.dataset = HICODet(
-                root=os.path.join(data_root, 'hico_20160224_det/images', partition),
-                anno_file=os.path.join(data_root, 'instances_{}.json'.format(partition)),
-                target_transform=pocket.ops.ToTensor(input_format='dict'),
-                args=args
-            )
+            if args.few_shot:
+                self.dataset = HICODet(
+                    root=os.path.join(data_root, 'hico_20160224_det/images', partition),
+                    anno_file=os.path.join(data_root, 'instances_by_distance_far.json'),
+                    target_transform=pocket.ops.ToTensor(input_format='dict'),
+                    args=args
+                )
+            else:
+                self.dataset = HICODet(
+                    root=os.path.join(data_root, 'hico_20160224_det/images', partition),
+                    anno_file=os.path.join(data_root, 'instances_{}.json'.format(partition)),
+                    target_transform=pocket.ops.ToTensor(input_format='dict'),
+                    args=args
+                )
         else:
             assert partition in ['train', 'val', 'trainval', 'test'], \
                 "Unknown V-COCO partition " + partition
@@ -91,6 +99,13 @@ class DataFactory(Dataset):
                 T.IResize([self.clip_input_resolution,self.clip_input_resolution]),
             ])
         else:
+            self.transforms = T.Compose([
+                T.RandomResize([800], max_size=1333),
+            ])
+            self.clip_transforms = T.Compose([
+                T.IResize([self.clip_input_resolution,self.clip_input_resolution]),
+            ])
+        if args.few_shot:
             self.transforms = T.Compose([
                 T.RandomResize([800], max_size=1333),
             ])

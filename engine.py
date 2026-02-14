@@ -121,8 +121,8 @@ class CustomisedDLE(DistributedLearningEngine):
             self._state.optimizer.step()
 
     def _on_end_epoch(self):
-        if self._rank == 0:
-            self.save_checkpoint()
+        # if self._rank == 0:
+        #     #self.save_checkpoint()
         if self._state.lr_scheduler is not None:
             self._state.lr_scheduler.step()
         self.net.object_class_to_target_class = self.test_loader.dataset.dataset.object_class_to_target_class
@@ -147,59 +147,61 @@ class CustomisedDLE(DistributedLearningEngine):
             #wandb.log(mAPs)
             return
             # raise NotImplementedError(f"Evaluation on V-COCO has not been implemented.")
-        if self._state.epoch % 5 == 0 or self._state.epoch >= 10 or self._state.epoch == 1:
-            start_test_time = time.time()
-            ap = self.test_hico(self.test_loader, self.args)
-            test_duration = time.time() - start_test_time
+        
+        start_test_time = time.time()
+        ap = self.test_hico(self.test_loader, self.args)
+        test_duration = time.time() - start_test_time
 
-            self.net.object_class_to_target_class = self.train_loader.dataset.dataset.object_class_to_target_class
-            self.net.tp = None
+        self.net.object_class_to_target_class = self.train_loader.dataset.dataset.object_class_to_target_class
+        #self.net.tp = None
 
-            # Fetch indices for rare and non-rare classes
-            num_anno = torch.as_tensor(self.train_loader.dataset.dataset.anno_interaction)
-            rare = torch.nonzero(num_anno < 10).squeeze(1)
-            non_rare = torch.nonzero(num_anno >= 10).squeeze(1)
-            if self._rank == 0:
-                mAPs = {'mAP': ap.mean() * 100,
-                        'rare': ap[rare].mean() * 100,
-                        'non-rare': ap[non_rare].mean() * 100
-                        }
+        # Fetch indices for rare and non-rare classes
+        num_anno = torch.as_tensor(self.train_loader.dataset.dataset.anno_interaction)
+        rare = torch.nonzero(num_anno < 10).squeeze(1)
+        non_rare = torch.nonzero(num_anno >= 10).squeeze(1)
+        if self._rank == 0:
+            mAPs = {'mAP': ap.mean() * 100,
+                    'rare': ap[rare].mean() * 100,
+                    'non-rare': ap[non_rare].mean() * 100
+                    }
 
+            print(
+                f"The mAP is {ap.mean() * 100:.2f},"
+                f" rare: {ap[rare].mean() * 100:.2f},"
+                f" none-rare: {ap[non_rare].mean() * 100:.2f},"
+            )
+
+            if self.args.zs:
+                zs_hoi_idx = hico_unseen_index[self.args.zs_type]
+                print(f'>>> zero-shot setting({self.args.zs_type}!!)')
+                ap_unseen = []
+                ap_seen = []
+                for i, value in enumerate(ap):
+                    if i in zs_hoi_idx:
+                        ap_unseen.append(value)
+                    else:
+                        ap_seen.append(value)
+
+                ap_unseen = torch.as_tensor(ap_unseen).mean()
+                ap_seen = torch.as_tensor(ap_seen).mean()
+
+                mAPs.update({"unseen": ap_unseen * 100, "seen": ap_seen * 100})
                 print(
-                    f"The mAP is {ap.mean() * 100:.2f},"
-                    f" rare: {ap[rare].mean() * 100:.2f},"
-                    f" none-rare: {ap[non_rare].mean() * 100:.2f},"
+                    f"full mAP: {ap.mean() * 100:.2f}",
+                    f"unseen: {ap_unseen * 100:.2f}",
+                    f"seen: {ap_seen * 100:.2f}",
                 )
 
-                if self.args.zs:
-                    zs_hoi_idx = hico_unseen_index[self.args.zs_type]
-                    print(f'>>> zero-shot setting({self.args.zs_type}!!)')
-                    ap_unseen = []
-                    ap_seen = []
-                    for i, value in enumerate(ap):
-                        if i in zs_hoi_idx:
-                            ap_unseen.append(value)
-                        else:
-                            ap_seen.append(value)
-
-                    ap_unseen = torch.as_tensor(ap_unseen).mean()
-                    ap_seen = torch.as_tensor(ap_seen).mean()
-
-                    mAPs.update({"unseen": ap_unseen * 100, "seen": ap_seen * 100})
-                    print(
-                        f"full mAP: {ap.mean() * 100:.2f}",
-                        f"unseen: {ap_unseen * 100:.2f}",
-                        f"seen: {ap_seen * 100:.2f}",
-                    )
-
-                log_file_path = os.path.join(self.args.output_dir, "eval_log.txt")
-                with open(log_file_path, "a") as f:
-                    f.write(f"Epoch {self._state.epoch} Evaluation Results:\n")
-                    f.write(f"Training time : {epoch_duration }\n")
-                    f.write(f"test time : {test_duration}\n")
-                    for k, v in mAPs.items():
-                        f.write(f"{k}: {v:.2f}\n")
-                    f.write("\n")
+            log_file_path = os.path.join(self.args.output_dir, "eval_log.txt")
+            with open(log_file_path, "a") as f:
+                f.write(f"Epoch {self._state.epoch} Evaluation Results:\n")
+                f.write(f"Training time : {epoch_duration }\n")
+                f.write(f"test time : {test_duration}\n")
+                for k, v in mAPs.items():
+                    f.write(f"{k}: {v:.2f}\n")
+                f.write("\n")
+        if self._rank == 0:
+            if self._state.epoch % 5 == 0 or self._state.epoch == 1:
                 self.save_checkpoint()
             #wandb.log(mAPs)
 
@@ -282,9 +284,105 @@ class CustomisedDLE(DistributedLearningEngine):
         for pred in gathered_pred_list:
             meter.append(*pred)
 
+        # Compute score sharpness analysis
+        sharpness_results = self.compute_score_sharpness(gathered_pred_list)
+        if self._rank == 0 and sharpness_results:
+            print("\n=== Score Calibration Analysis (Cross-Entropy) ===")
+            if 'all' in sharpness_results:
+                a = sharpness_results['all']
+                print(f"All (n={a['count']}): "
+                      f"mean_score={a['mean_score']:.4f} (±{a['std_score']:.4f}), "
+                      f"mean_ce={a['mean_ce']:.4f} (±{a['std_ce']:.4f})")
+            if 'tp' in sharpness_results:
+                tp = sharpness_results['tp']
+                print(f"True Positives (n={tp['count']}): "
+                      f"mean_score={tp['mean_score']:.4f} (±{tp['std_score']:.4f}), "
+                      f"mean_ce={tp['mean_ce']:.4f} (±{tp['std_ce']:.4f})")
+            if 'fp' in sharpness_results:
+                fp = sharpness_results['fp']
+                print(f"False Positives (n={fp['count']}): "
+                      f"mean_score={fp['mean_score']:.4f} (±{fp['std_score']:.4f}), "
+                      f"mean_ce={fp['mean_ce']:.4f} (±{fp['std_ce']:.4f})")
+            print("=================================================\n")
 
         ap = meter.eval()
         return ap
+
+    def compute_score_sharpness(self, pred_list):
+        """
+        Analyze calibration of scores using cross-entropy.
+        Compare true positive vs false positive detections.
+
+        Cross-entropy CE(p, y) = -y*log(p) - (1-y)*log(1-p)
+        - For TP (y=1): CE = -log(p) -> low when score is high (good)
+        - For FP (y=0): CE = -log(1-p) -> low when score is low (good)
+        - Lower CE overall means better calibrated predictions
+        """
+        all_scores_tp = []
+        all_scores_fp = []
+
+        for scores, interactions, labels in pred_list:
+            tp_mask = labels > 0
+            fp_mask = labels == 0
+
+            if tp_mask.any():
+                all_scores_tp.append(scores[tp_mask])
+            if fp_mask.any():
+                all_scores_fp.append(scores[fp_mask])
+
+        scores_tp = torch.cat(all_scores_tp) if all_scores_tp else torch.tensor([])
+        scores_fp = torch.cat(all_scores_fp) if all_scores_fp else torch.tensor([])
+
+        def cross_entropy(p, y):
+            """CE = -y*log(p) - (1-y)*log(1-p)"""
+            p = torch.clamp(p, 1e-7, 1 - 1e-7)
+            return -y * torch.log(p) - (1 - y) * torch.log(1 - p)
+
+        results = {}
+
+        # All scores combined with labels
+        if len(scores_tp) > 0 or len(scores_fp) > 0:
+            all_scores = []
+            all_labels = []
+            if len(scores_tp) > 0:
+                all_scores.append(scores_tp)
+                all_labels.append(torch.ones_like(scores_tp))
+            if len(scores_fp) > 0:
+                all_scores.append(scores_fp)
+                all_labels.append(torch.zeros_like(scores_fp))
+            scores_all = torch.cat(all_scores)
+            labels_all = torch.cat(all_labels)
+            ce_all = cross_entropy(scores_all, labels_all)
+            results['all'] = {
+                'count': len(scores_all),
+                'mean_score': scores_all.mean().item(),
+                'std_score': scores_all.std().item(),
+                'mean_ce': ce_all.mean().item(),
+                'std_ce': ce_all.std().item(),
+            }
+
+        if len(scores_tp) > 0:
+            ce_tp = cross_entropy(scores_tp, torch.ones_like(scores_tp))  # y=1 for TP
+            results['tp'] = {
+                'count': len(scores_tp),
+                'mean_score': scores_tp.mean().item(),
+                'std_score': scores_tp.std().item(),
+                'mean_ce': ce_tp.mean().item(),
+                'std_ce': ce_tp.std().item(),
+            }
+
+        if len(scores_fp) > 0:
+            ce_fp = cross_entropy(scores_fp, torch.zeros_like(scores_fp))  # y=0 for FP
+            results['fp'] = {
+                'count': len(scores_fp),
+                'mean_score': scores_fp.mean().item(),
+                'std_score': scores_fp.std().item(),
+                'mean_ce': ce_fp.mean().item(),
+                'std_ce': ce_fp.std().item(),
+            }
+        #import pdb; pdb.set_trace()
+        return results
+
     def measure_fps_100(self, dataloader, args=None):
         net = self._state.net
         net.eval()

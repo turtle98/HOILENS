@@ -4,14 +4,18 @@ let port=$RANDOM%5000+5000
 let id=$RANDOM%5000+5000
 gpu_num=1
 WANDB__SERVICE_WAIT=300
-
-CUDA_VISIBLE_DEVICES=6 torchrun --rdzv_id $id --rdzv_backend=c10d --nproc_per_node=$gpu_num --rdzv_endpoint=127.0.0.1:$port \
-         main_llava_training.py --pretrained checkpoints/pretrained_detr/detr-r50-hicodet.pth --clip_dir_vit checkpoints/pretrained_clip/ViT-L-14-336px.pt --output-dir /home/taehoon/HOILENS/checkpoints/ECCV/zeroshot_noattnmod_loglikelihood \
-         --dataset hicodet --zs --zs_type non_rare_first --num_classes 117 --num-workers 4 \
-         --epochs 10 --lr-head 1e-4 --lr-drop 5 \
-         --adapt_dim 128 --batch-size 1 \
-         --print-interval 100 --layer 30 --eval
-
+CUDA_VISIBLE_DEVICES=4 torchrun --rdzv_id $id --rdzv_backend=c10d --nproc_per_node=$gpu_num --rdzv_endpoint=127.0.0.1:$port \
+         main_llava_training.py --pretrained checkpoints/pretrained_detr/detr-r50-hicodet.pth --clip_dir_vit checkpoints/pretrained_clip/ViT-L-14-336px.pt --output-dir /home/taehoon/HOILENS/checkpoints/ECCV/train/0213/ours_new_llavaloraonly_rankingbasedprob \
+         --dataset hicodet --num_classes 117 --num-workers 4 \
+         --epochs 10  --zs --zs_type unseen_verb --lr-head 1e-3 --lr-lora 1e-4 --lr-drop 5 \
+         --adapt_dim 128 --batch-size 4 --start_idx 1 --end_idx 32 \
+         --print-interval 100 --layer 32  #--resume /home/taehoon/HOILENS/checkpoints/ECCV/train/0213/ours_new_rankingbasedprob/ckpt_22220_10.pt --eval # --eval
+# CUDA_VISIBLE_DEVICES=3 torchrun --rdzv_id $id --rdzv_backend=c10d --nproc_per_node=$gpu_num --rdzv_endpoint=127.0.0.1:$port \
+#          main_llava_training.py --pretrained checkpoints/pretrained_detr/detr-r50-hicodet.pth --clip_dir_vit checkpoints/pretrained_clip/ViT-L-14-336px.pt --output-dir /home/taehoon/HOILENS/checkpoints/ECCV/zeroshot_newsubset_block_attn_midtolate_layers_loglikelihood_gt \
+#          --dataset hicodet --num_classes 117 --num-workers 4 \q
+#          --epochs 10 --lr-head 1e-4 --lr-drop 5 \
+#          --adapt_dim 128 --batch-size 1 --start_idx 11 --end_idx 32 \
+#          --print-interval 100 --eval --few_shot --attn_mod
 
 # CUDA_VISIBLE_DEVICES=3,5 torchrun --rdzv_id $id --rdzv_backend=c10d --nproc_per_node=$gpu_num --rdzv_endpoint=127.0.0.1:$port \
 #          main_llava_training.py --pretrained checkpoints/pretrained_detr/detr-r50-hicodet.pth --clip_dir_vit checkpoints/pretrained_clip/ViT-L-14-336px.pt --output-dir /hub_data1/taehoonsong/LAIN/checkpoints/CVPR/orig_llava/no_text_tokens/UV/30_epoch20/hub_data1/taehoonsong/LAIN/checkpoints/CVPR/orig_llava/no_text_tokens/UV/30_epoch20_lr1e4_drop10_nosigmoid_new_1104 \

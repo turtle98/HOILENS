@@ -4,13 +4,12 @@ let port=$RANDOM%5000+5000
 let id=$RANDOM%5000+5000
 gpu_num=1
 WANDB__SERVICE_WAIT=300
-
-CUDA_VISIBLE_DEVICES=1 torchrun --rdzv_id $id --rdzv_backend=c10d --nproc_per_node=$gpu_num --rdzv_endpoint=127.0.0.1:$port \
-         main_llava_training.py --pretrained checkpoints/pretrained_detr/detr-r50-hicodet.pth --clip_dir_vit checkpoints/pretrained_clip/ViT-L-14-336px.pt --output-dir /home/taehoon/HOILENS/checkpoints/ECCV/zeroshot_attnmod1015_loglikelihood \
-         --dataset hicodet --zs --zs_type non_rare_first --num_classes 117 --num-workers 4 \
+CUDA_VISIBLE_DEVICES=4 torchrun --rdzv_id $id --rdzv_backend=c10d --nproc_per_node=$gpu_num --rdzv_endpoint=127.0.0.1:$port \
+         main_llava_training.py --pretrained checkpoints/pretrained_detr/detr-r50-hicodet.pth --clip_dir_vit checkpoints/pretrained_clip/ViT-L-14-336px.pt --output-dir /home/taehoon/HOILENS/checkpoints/ECCV/binarypolling/focus_attn_obox_all_layers \
+         --dataset hicodet --num_classes 117 --num-workers 4 \
          --epochs 10 --lr-head 1e-4 --lr-drop 5 \
-         --adapt_dim 128 --batch-size 1 --start_idx 10 --end_idx 16  \
-         --print-interval 100 --layer 30 --eval
+         --adapt_dim 128 --batch-size 1 --start_idx 1 --end_idx 32 \
+         --print-interval 100 --eval --few_shot
 
 
 # CUDA_VISIBLE_DEVICES=3,5 torchrun --rdzv_id $id --rdzv_backend=c10d --nproc_per_node=$gpu_num --rdzv_endpoint=127.0.0.1:$port \

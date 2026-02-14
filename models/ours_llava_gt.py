@@ -20,7 +20,7 @@ import numpy as np
 import torchvision 
 #import wandb
 
-from utils.hico_list import hico_verbs_sentence, hico_verb_object_list, hico_verbs
+from utils.hico_list import hico_verbs_sentence, hico_verb_object_list, hico_verbs, hico_objects
 from utils.vcoco_list import vcoco_verbs_sentence
 from utils.hico_utils import reserve_indices
 from utils.postprocessor import PostProcess
@@ -195,7 +195,7 @@ class HOILLAVA(nn.Module):
         # self.h_steer = verbsteer(in_dim=4096, out_dim=4096, rank=args.adapt_dim)
         # self.o_steer = verbsteer(in_dim=4096, out_dim=4096, rank=args.adapt_dim)
         # self.ho_steer = verbsteer(in_dim=4096, out_dim=4096, rank=args.adapt_dim)
-        # #self.lm_head_embeddings = torch.load("/hub_data1/taehoonsong/HOICLIP/training_linearshortcut/lm_head_embedding.pt", "cpu")
+        self.lm_head_embeddings = torch.load("/home/taehoon/HOICLIP/training_linearshortcut/lm_head_embedding_7b.pt", "cpu")
 
         # self.verb_classifier_ho = torch.load("/home/taehoon/HOICLIP/training_linearshortcut/verb_classifier_weights_ho_7b.pt", "cpu").float()
         # #self.verb_classifier_ho = self.clip_head.linear_shortcut(self.verb_classifier_ho)
@@ -248,6 +248,7 @@ class HOILLAVA(nn.Module):
         target_cls_idx = [self.object_class_to_target_class[obj.item()]
             for obj in object_class[y]]
         # Duplicate box pair indices for each target class
+        #import pdb; pdb.set_trace()
         pair_idx = [i for i, tar in enumerate(target_cls_idx) for _ in tar]
         # Flatten mapped target indices
         flat_target_idx = [t for tar in target_cls_idx for t in tar]
@@ -265,62 +266,50 @@ class HOILLAVA(nn.Module):
         # pairwise_tokens_collated = []
         all_logits_collated = []
         all_boxes_collated = []
-        all_ing_logits_collated = []
-        all_ed_logits_collated = []
-        all_orig_feats_collated = []
         all_feats_collated = []
-        all_mvid_collated = []
-        all_zs_logits_collated = []
         # get updated HO tokens.
         for b_idx, props in enumerate(region_props):
             # local_features = features[b_idx]
-            boxes = props['boxes']
-            scores = props['scores']
-            labels = props['labels']
-            feats = props['feat']
+            gt_bx_h = self.recover_boxes(targets[0]['boxes_h'], targets[0]['size']).to(targets[0]['object'].device)
+            gt_bx_o = self.recover_boxes(targets[0]['boxes_o'], targets[0]['size']).to(targets[0]['object'].device)
+            boxes = torch.cat([gt_bx_h,gt_bx_o]).to(targets[0]['object'].device)
+            scores = torch.ones([boxes.shape[0]]).to(targets[0]['object'].device)
+            labels = torch.cat([torch.zeros([len(gt_bx_h)], dtype=torch.long, device=targets[0]['object'].device),targets[0]['object']])
+            # feats = props['feat']
+            N = labels.numel()
+            mid = N // 2
 
-            
+            idx = torch.arange(N, device=labels.device)
 
-            hidden_states = run_llava_model(
-                self.clip_head,
-                self.clip_head['model_name'],
-                image.decompose()[0][b_idx:b_idx + 1].half(),
-                (336,336),
-                self.clip_head['tokenizer'],
-                hidden_states=True,
-                text_prompt="."
-            )
-            llava_features = hidden_states[self.args.layer].float()
-            import pdb; pdb.set_trace()
+            x_keep = idx[:mid].to(targets[0]['object'].device)
+            y_keep = idx[mid:].to(targets[0]['object'].device)
 
+            # is_human = labels == self.human_idx
+            # n_h = torch.sum(is_human); n = len(boxes)
 
-            is_human = labels == self.human_idx
-            n_h = torch.sum(is_human); n = len(boxes)
-
-            # Permute human instances to the top
-            if not torch.all(labels[:n_h]==self.human_idx):
-                h_idx = torch.nonzero(is_human).squeeze(1)
-                o_idx = torch.nonzero(is_human == 0).squeeze(1)
-                perm = torch.cat([h_idx, o_idx])
-                boxes = boxes[perm]; scores = scores[perm]
-                labels = labels[perm]
-            # Skip image when there are no valid human-object pairs
-            if n_h == 0 or n <= 1:
-                boxes_h_collated.append(torch.zeros(0, device=device, dtype=torch.int64))
-                boxes_o_collated.append(torch.zeros(0, device=device, dtype=torch.int64))
-                object_class_collated.append(torch.zeros(0, device=device, dtype=torch.int64))
-                prior_collated.append(torch.zeros(2, 0, self.num_classes, device=device))
-            #import pdb; pdb.set_trace()
-                continue
-            # Get the pairwise indices
-            x, y = torch.meshgrid(
-                torch.arange(n, device=device),
-                torch.arange(n, device=device)
-            )
-            # Valid human-object pairs
-            x_keep, y_keep = torch.nonzero(torch.logical_and(x != y, x < n_h)).unbind(1)
-
-            
+            # # Permute human instances to the top
+            # if not torch.all(labels[:n_h]==self.human_idx):
+            #     h_idx = torch.nonzero(is_human).squeeze(1)
+            #     o_idx = torch.nonzero(is_human == 0).squeeze(1)
+            #     perm = torch.cat([h_idx, o_idx])
+            #     boxes = boxes[perm]; scores = scores[perm]
+            #     labels = labels[perm]
+            # # Skip image when there are no valid human-object pairs
+            # if n_h == 0 or n <= 1:
+            #     boxes_h_collated.append(torch.zeros(0, device=device, dtype=torch.int64))
+            #     boxes_o_collated.append(torch.zeros(0, device=device, dtype=torch.int64))
+            #     object_class_collated.append(torch.zeros(0, device=device, dtype=torch.int64))
+            #     prior_collated.append(torch.zeros(2, 0, self.num_classes, device=device))
+            # #import pdb; pdb.set_trace()
+            #     continue
+            # # Get the pairwise indices
+            # x, y = torch.meshgrid(
+            #     torch.arange(n, device=device),
+            #     torch.arange(n, device=device)
+            # )
+            # # Valid human-object pairs
+            # x_keep, y_keep = torch.nonzero(torch.logical_and(x != y, x < n_h)).unbind(1)
+  
             if len(x_keep) == 0:
                 # Should never happen, just to be safe
                 raise ValueError("There are no valid human-object pairs")
@@ -346,62 +335,67 @@ class HOILLAVA(nn.Module):
             
 
             #mport pdb; pdb.set_trace()
-            bbox_2_tokens = bbox_to_token((336,336),boxes, 24)
+            # bbox_2_tokens = bbox_to_token((336,336),boxes, 24)
+            # bool_h = bbox_2_tokens[x_keep]
+            # bool_o = bbox_2_tokens[y_keep]
+            # bool_union = bool_h | bool_o
             bbox_2_tokens_h = bbox_to_token((336,336),gt_bx_h, 24)
             bbox_2_tokens_o = bbox_to_token((336,336),gt_bx_o, 24)
             bool_h = bbox_2_tokens_h 
             bool_o = bbox_2_tokens_o
             bool_union = bool_h | bool_o
-            #bool_intersection = bool_h & bool_o
-            # bool_h = bbox_2_tokens[x_keep]
-            # bool_o = bbox_2_tokens[y_keep]
-            # bool_union = bool_h | bool_o
-
-            # llama_modify(
-            #     self.clip_head['model'],
-            #     args.start_layer,
-            #     args.end_layer,
-            #     args.use_attn,
-            #     args.alpha,
-            #     args.use_cfg,
-            #     model_loader.img_start_idx,
-            #     model_loader.img_end_idx,
-            # )
+            bool_intersection = bool_h & bool_o
 
             img_start_idx, img_end_idx, prefix_prompt_end_idx = get_img_idx(self.clip_head, self.clip_head['model_name'], self.clip_head['tokenizer'],  "A photo of a person ")
 
 
-            #import pdb; pdb.set_trace()
-
             results_per_object = []
             for i in range(bool_o.shape[0]):
-                llama_modify(
-                    self.clip_head['model'],
-                    21,
-                    32,
-                    True,
-                    0.5,
-                    False,
-                    img_start_idx,
-                    img_end_idx,
-                    bool_union[i],
-                    prefix_prompt_end_idx,
-                    None,
-                    None
-                )
+                # if self.args.attn_mod:
+                #     llama_modify(
+                #         self.clip_head['model'],
+                #         self.args.start_idx,
+                #         self.args.end_idx,
+                #         True,
+                #         0.5,
+                #         False,
+                #         img_start_idx,
+                #         img_end_idx,
+                #         bool_union[i],
+                #         prefix_prompt_end_idx,
+                #         None,
+                #         None,
+                #         self.args.focus
+                #     )
                 for candidates in candidate_texts[i]:
                     #import pdb; pdb.set_trace()
-                    log_probs, probs = compute_conditional_likelihood_llava(
+                    log_probs, probs, hidden_states, tgt_hidden_states = compute_conditional_likelihood_llava(
                         self.clip_head,
                         self.clip_head['model_name'],
                         image.decompose()[0][b_idx:b_idx + 1].half(),
                         (336,336),
                         self.clip_head['tokenizer'],
-                       #"Provide the correct human-object interaction in the image: a photo of a person ",
+                        #"Provide the correct human-object interaction in the image: a photo of a person ",
+                        #f"Provide the correct interaction between the person and the {hico_objects[candidates[0][-1]]}",
+                        #"Provide the correct human-object interaction that goes in "a photo of a person <interaction> an object",
                         "A photo of a person ",
                         candidates[-1],   # Now just ["person boarding an airplane", "person directing an airplane", ...]
                     )
 
+                    # logit_lens = hidden_states @ self.lm_head_embeddings.T.to(hidden_states.device).half()
+                    # k = 5  # or whatever you want
+
+                    # logits = logit_lens[-1][0]        # [576, 32000]
+                    # topk_vals, topk_ids = torch.topk(logits, k, dim=-1)
+                    # self.clip_head['tokenizer'].decode(topk_ids[bool_union[i]][1])
+
+                    # logit_lens_tgt = tgt_hidden_states @ self.lm_head_embeddings.T.to(hidden_states.device).half()
+                    # k = 5  # or whatever you want
+
+                    # logits_tgt = logit_lens_tgt[-1][0]        # [576, 32000]
+                    # topk_vals, topk_ids = torch.topk(logits_tgt, k, dim=-1)
+                    # self.clip_head['tokenizer'].decode(topk_ids[0])
+                    # import pdb; pdb.set_trace()
                     # Save candidates with their probabilities
                     results_per_object.append({
                         'pair': i,
@@ -412,86 +406,10 @@ class HOILLAVA(nn.Module):
             # Sort by probability (descending order)
             results_per_object_sorted = sorted(results_per_object, key=lambda x: x['probs'], reverse=True)
 
-
-            #import pdb; pdb.set_trace()
-# attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-
-            # ho_detr_feats = self.ho_query_proj(torch.cat([feats[x_keep],feats[y_keep]],dim=-1))
-            # h_detr_feats = self.h_query_proj(feats[h_unique_indices])
-            # o_detr_feats = self.o_query_proj(feats[o_unique_indices])
-           
-            # text_2_query = self.text_2_queries(F.normalize(self.object_embedding.float(), 2, -1))
-            # #ing_dir = self.text_2_queries(self.ing.to(device))
-            # h_text = text_2_query[labels[h_unique_indices]] #+ ing_dir.unsqueeze(0)
-            # o_text = text_2_query[labels[o_unique_indices]] #+ ing_dir.unsqueeze(0)
-            # #ho_text = h_text[h_inverse_indices] + o_text[o_inverse_indices]
-            # ho_text = self.ho_text_query_proj(torch.cat([h_text[h_inverse_indices],o_text[o_inverse_indices]],dim=-1)) #+ ing_dir.unsqueeze(0)
-            # bbox_2_tokens = bbox_to_token((336,336),boxes, 24)
-            # x_boxes = boxes[x_keep]  # shape: (N, 4)
-            # y_boxes = boxes[y_keep]  # shape: (N, 4)
-
             x_boxes= gt_bx_h
             y_boxes= gt_bx_o
 
-            # Union box: min of top-left corner, max of bottom-right corner
-            # x1 = torch.min(x_boxes[:, 0], y_boxes[:, 0])
-            # y1 = torch.min(x_boxes[:, 1], y_boxes[:, 1])
-            # x2 = torch.max(x_boxes[:, 2], y_boxes[:, 2])
-            # y2 = torch.max(x_boxes[:, 3], y_boxes[:, 3])
-
-            # union_boxes = torch.stack([x1, y1, x2, y2], dim=1)  # shape: (N, 4)
-            # union_tokens  = bbox_to_token((336,336),union_boxes, 24)
-
-            
-            #import pdb; pdb.set_trace()
-            ## boxes_xyxy = boxes[h_unique_indices]  # shape [K, 4]
-            # batch_indices = torch.zeros((boxes_xyxy.size(0),), dtype=torch.long, device=boxes_xyxy.device)  # shape [K]
-            # roi_boxes = torch.cat([batch_indices[:, None].float(), boxes_xyxy], dim=1)  # shape [K, 5]
-
-            # boxes_xyxy1 = boxes[o_unique_indices]  # shape [K, 4]
-            # batch_indices1 = torch.zeros((boxes_xyxy1.size(0),), dtype=torch.long, device=boxes_xyxy1.device)  # shape [K]
-            # roi_boxes1 = torch.cat([batch_indices1[:, None].float(), boxes_xyxy1], dim=1)  # shape [K, 5]
-
-
-            # boxes_xyxy2 = union_boxes  # shape [K, 4]
-            # batch_indices2 = torch.zeros((boxes_xyxy2.size(0),), dtype=torch.long, device=boxes_xyxy2.device)  # shape [K]
-            # roi_boxes2 = torch.cat([batch_indices2[:, None].float(), boxes_xyxy2], dim=1)  # shape [K, 5]
-
-
-            # h_feats0 = torchvision.ops.roi_align(llava_features.view(1, 24, 24, 4096).permute(0, 3, 1, 2),  roi_boxes,
-            #                                         output_size=(7, 7),
-            #                                         spatial_scale=24 / 336, aligned=True)
-            # o_feats0 = torchvision.ops.roi_align(llava_features.view(1, 24, 24, 4096).permute(0, 3, 1, 2),  roi_boxes1,
-            #                                         output_size=(7, 7),
-            #                                         spatial_scale=24 / 336, aligned=True)
-
-            # ho_feats0 = torchvision.ops.roi_align(llava_features.view(1, 24, 24, 4096).permute(0, 3, 1, 2), roi_boxes2,
-            #                                         output_size=(7, 7),
-            #                                         spatial_scale=24 / 336, aligned=True)
-
-            # ho_feats0 = ho_feats0.flatten(2).mean(-1)
-            # h_feats0 = h_feats0.flatten(2).mean(-1)
-            # o_feats0 = o_feats0.flatten(2).mean(-1)
-            # if self.args.cls_token:
-            #     h_feats1 = self.h_llava_2_queries(h_feats0 + last_hidden_states[30].float())
-            #     o_feats1 = self.o_llava_2_queries(o_feats0 + last_hidden_states[30].float())
-            #     ho_feats1 = self.ho_llava_2_queries(ho_feats0 + last_hidden_states[30].float())
-            # else:
-            # h_feats1 = self.h_llava_2_queries(h_feats0)
-            # o_feats1 = self.o_llava_2_queries(o_feats0)
-            # ho_feats1 = self.ho_llava_2_queries(ho_feats0)
-            # import pdb; pdb.set_trace()
-
-            # h_tokens , _ = self.h_steer(h_feats1, h_detr_feats, boxes[h_unique_indices], targets[b_idx]['size'], llava_features, h_text)
-            # o_tokens , _ = self.o_steer(o_feats1, o_detr_feats, boxes[o_unique_indices], targets[b_idx]['size'], llava_features, o_text) 
-            # ho_tokens, _ = self.ho_steer(ho_feats1, ho_detr_feats, union_boxes, targets[b_idx]['size'], llava_features, ho_text)
-            #self.verb_projection_ho(ho_tokens + torch.sigmoid(self.ho_alpha_logit) * ho_feats0)
-            #import pdb; pdb.set_trace()
-            # ho_logits = self.verb_projection_ho(ho_feats0) #+ torch.sigmoid(self.ho_alpha_logit) * ho_feats0) #/ math.sqrt(4096)
-            # h_logits = self.verb_projection_ho(h_feats0) #+ torch.sigmoid(self.h_alpha_logit) * h_feats0) #/ math.sqrt(4096)
-            # o_logits = self.verb_projection_ho(o_feats0) #+ torch.sigmoid(self.o_alpha_logit) * o_feats0) #/ math.sqrt(4096)
-
-            obj_labels =targets[0]["object"]
+            obj_labels = targets[0]["object"]
             #obj_labels = labels[y_keep]          # [N]
             obj_verb_to_score = defaultdict(float)
             N = obj_labels.shape[0]
@@ -503,67 +421,28 @@ class HOILLAVA(nn.Module):
             )
 
             rows = torch.tensor([r["pair"] for r in results_per_object_sorted], device=device, dtype=torch.long)
-            #max_pair = rows.max().item()
             cols = torch.tensor([r["candidates"][0][0] for r in results_per_object_sorted], device=device, dtype=torch.long)  # verb_idx
             vals = torch.tensor([r["probs"][0] for r in results_per_object_sorted], device=device, dtype=torch.float32)
 
-            # ---- 2) Build [N, 117] with zeros for missing candidates ----
             final_logits = torch.zeros((N, num_verbs), device=device, dtype=torch.float32)
 
             final_logits[rows, cols] = vals
-            nz_mask = final_logits != 0
-            nz_vals = final_logits[nz_mask]
 
-            # 2) Find duplicated values
-            unique_vals, counts = torch.unique(nz_vals, return_counts=True)
-            dup_vals = unique_vals[counts > 1]
-
-            # 3) Zero them out
-            dup_mask = torch.isin(final_logits, dup_vals)
-            final_logits[dup_mask] = 0.0
-
-            # import pdb; pdb.set_trace()
-            # # If multiple candidates hit the same (pair, verb), keep max (safer than overwrite)
-            # # scatter_reduce_ is available in newer PyTorch; if not, use the fallback below.
-            # if hasattr(final_logits, "scatter_reduce_"):
-            #     final_logits.scatter_reduce_(1, cols[:, None], vals[:, None], reduce="amax", include_self=True) 
-            #     # ^ scatter_reduce_ only scatters along one dim. We'll do proper 2D scatter below instead.
-            #     final_logits.zero_()
-
-            # # Proper 2D scatter: linearize indices
-            # flat_idx = N * num_verbs + cols
-            #return final_logits
-
-            # for r in results_per_object_sorted:
-            #     idx, (verb_idx, obj_idx), _ = r['candidates']
-
-            #     score = r['probs'][0]
-
-            #     # keep max if duplicated
-            #     key = (obj_idx, verb_idx)
-            #     obj_verb_to_score[key] = max(obj_verb_to_score[key], score)
-            # obj_labels = labels[y_keep]          # [N]
-
-
-            # for i, obj in enumerate(obj_labels.tolist()):
-            #     for verb_idx in range(num_verbs):
-            #         final_logits[i, verb_idx] = obj_verb_to_score.get(
-            #             (obj, verb_idx), 0.0
-            #         )
-            #import pdb; pdb.set_trace()
             logits = final_logits
 
-        
+            #import pdb; pdb.set_trace()
             boxes_h_collated.append(x_keep)
             boxes_o_collated.append(y_keep)
             object_class_collated.append(labels[y_keep])
             prior_collated.append(self.compute_prior_scores(
                 x_keep, y_keep, scores, labels)
             )
+            #gt_labels = torch.ones([N])
             all_logits_collated.append(logits)
-            import pdb; pdb.set_trace()
+            all_boxes_collated.append(boxes)
+            #import pdb; pdb.set_trace()
 
-        return all_logits_collated, prior_collated, boxes_h_collated, boxes_o_collated, object_class_collated
+        return all_logits_collated, prior_collated, boxes_h_collated, boxes_o_collated, object_class_collated, all_boxes_collated
 
     def recover_boxes(self, boxes, size):
         #import pdb; pdb.set_trace()
@@ -716,9 +595,7 @@ class HOILLAVA(nn.Module):
         results = self.postprocessor(results, image_sizes)
         region_props = self.prepare_region_proposals(results)
         images_clip = nested_tensor_from_tensor_list(images_clip)
-        logits, prior, bh, bo, objects = self.compute_sim_scores(region_props,images_clip,targets, None )
-        boxes = [r['boxes'] for r in region_props]
-
+        logits, prior, bh, bo, objects, boxes = self.compute_sim_scores(region_props,images_clip,targets, None )
         if self.training:
             interaction_loss = self.compute_interaction_loss(boxes, bh, bo, logits, prior, targets)
 

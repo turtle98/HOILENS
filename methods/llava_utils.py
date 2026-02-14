@@ -31,6 +31,53 @@ from transformers.generation.logits_process import TopKLogitsWarper
 from transformers.generation.logits_process import LogitsProcessorList
 
 
+def compute_binary_conditional_likelihood_llava(
+    model,
+    model_name,
+    images_tensor,
+    image_sizes,
+    tokenizer,
+    prefix_prompt,  # e.g., "Select the correct interaction from the list:"
+    target_text,   # List of strings, e.g., ["a photo of a person kicking a ball", ...]
+):
+    # Generate conversation template with prefix
+    conv = generate_text_prompt(model["model"], model_name, prefix_prompt)
+    prefix_with_image = conv.get_prompt()
+    
+    # Tokenize prefix (contains image token placeholder -200)
+    prefix_ids = prompt_to_img_input_ids(prefix_with_image, tokenizer)
+    
+    log_probs = []
+    
+    with torch.inference_mode():
+        # Forward pass to get logits
+        #import pdb; pdb.set_trace()
+        outputs = model["model"](
+            input_ids=prefix_ids,
+            images=images_tensor,
+            image_sizes=image_sizes,
+            return_dict=True,
+            output_attentions=True
+        )
+        
+        # Logits shape: [batch_size, seq_len, vocab_size]
+        logits = outputs.logits
+
+
+    next_token_logits = logits[:, -1, :]  # [1, vocab_size]
+    log_probs = torch.log_softmax(next_token_logits, dim=-1)
+    yes_id = tokenizer("Yes", add_special_tokens=False).input_ids
+    no_id  = tokenizer("No",  add_special_tokens=False).input_ids
+
+    yes_logp = log_probs[0, yes_id]
+    no_logp  = log_probs[0, no_id]
+
+    yes_prob = yes_logp.exp().item()
+    no_prob  = no_logp.exp().item()
+    
+    return yes_prob, no_prob
+
+
 def compute_conditional_likelihood_llava(
     model,
     model_name,
@@ -76,15 +123,23 @@ def compute_conditional_likelihood_llava(
         ids = full_input_ids[0]
         valid = (ids >= 0) & (ids < tokenizer.vocab_size)
         # Forward pass to get logits
+        #import pdb; pdb.set_trace()
         outputs = model["model"](
             input_ids=full_input_ids,
             images=images_tensor,
             image_sizes=image_sizes,
             return_dict=True,
+            output_hidden_states=True
         )
         
         # Logits shape: [batch_size, seq_len, vocab_size]
         logits = outputs.logits
+
+
+        hidden_states = torch.stack(outputs.hidden_states)
+        image_token_index = full_input_ids.tolist()[0].index(-200)
+       
+        visual_hidden_states = hidden_states[:, :, image_token_index : image_token_index + (24 * 24),:]
 
         # Get logits that predict target tokens
 
@@ -96,6 +151,7 @@ def compute_conditional_likelihood_llava(
         target_logits = logits[0, actual_prefix_len-1:actual_prefix_len-1+target_len, :]
         #import pdb; pdb.set_trace()
         # Compute log softmax
+        tgt_hidden_states = hidden_states[:, :, actual_prefix_len-1:actual_prefix_len-1+target_len, :]
         log_probs_dist = torch.nn.functional.log_softmax(target_logits, dim=-1)
         
         # Extract log prob of actual target tokens
@@ -103,6 +159,7 @@ def compute_conditional_likelihood_llava(
         #import pdb; pdb.set_trace()
         # Average log probability across tokens
         # Perplexity (lower is better)
+        #import pdb; pdb.set_trace()
         # perplexity = torch.exp(-token_log_probs.mean()).item()
         avg_log_prob = token_log_probs.mean().item()
         log_probs.append(avg_log_prob)
@@ -110,7 +167,7 @@ def compute_conditional_likelihood_llava(
     # Convert to probabilities
     probs = [np.exp(lp) for lp in log_probs]
     
-    return log_probs, probs
+    return log_probs, probs, visual_hidden_states, tgt_hidden_states
 
 
 # Example usage:
@@ -207,52 +264,70 @@ def run_llava_model(
     text_prompt=None,
     hidden_states=False,
 ):
-    if text_prompt == None:
+    if text_prompt is None:
         text_prompt = "Write a detailed description."
-    if text_prompt == ".":
-        max_new_tokens = 1
-    else:
-        max_new_tokens = 1024
+
     conv = generate_text_prompt(model["model"], model_name, text_prompt)
     input_ids = prompt_to_img_input_ids(conv.get_prompt(), tokenizer)
-    #model = model.to
-    #import pdb; pdb.set_trace()
-    # Model parameters
-    stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
-    keywords = [stop_str]
-    stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
+
+    output = model["model"](
+        input_ids=input_ids,
+        images=images_tensor,
+        image_sizes=[image_sizes],
+        output_hidden_states=True,
+        return_dict=True,
+    )
+
+    # output.hidden_states: tuple of (num_layers+1) x [1, seq_len, dim]
+    hidden = torch.stack(output.hidden_states)  # [layers+1, 1, seq_len, dim]
+    image_token_index = input_ids.tolist()[0].index(-200)
+    img_hidden_states = hidden[:, :, image_token_index : image_token_index + (24 * 24), :]
+
+    return img_hidden_states, output, None, None
+
+
+def generate_llava_model(
+    model,
+    model_name,
+    images_tensor,
+    image_sizes,
+    tokenizer,
+    text_prompt=None,
+    hidden_states=False,
+):
+    if text_prompt is None:
+        text_prompt = "Write a detailed description."
+
+    conv = generate_text_prompt(model["model"], model_name, text_prompt)
+    input_ids = prompt_to_img_input_ids(conv.get_prompt(), tokenizer)
 
     with torch.inference_mode():
         output = model["model"].generate(
-            input_ids,
+            inputs=input_ids,
             images=images_tensor,
-            temperature=1.0,
+            image_sizes=[image_sizes],
+            do_sample=False,
             num_beams=1,
-            max_new_tokens=max_new_tokens,
-            # use_cache=True,
-            use_cache=True,
-            stopping_criteria=[stopping_criteria],
-            output_hidden_states=hidden_states,
+            max_new_tokens=1024,
             return_dict_in_generate=True,
-            image_sizes=image_sizes,
+            output_hidden_states=True,
         )
 
-
-    outputs = tokenizer.batch_decode(output.sequences, skip_special_tokens=True)[
-        0
-    ].strip()
-
-    hidden_states = torch.stack(output.hidden_states[0])
+    hidden = torch.stack(output.hidden_states[0])  # [layers+1, 1, seq_len, dim]
     image_token_index = input_ids.tolist()[0].index(-200)
-    hidden_states = hidden_states[:, :, image_token_index : image_token_index + (24 * 24),:]
-    return hidden_states
+    img_hidden_states = hidden[:, :, image_token_index : image_token_index + (24 * 24), :]
+
+    generated_ids = output.sequences
+    generated_text = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+
+    return img_hidden_states, generated_text,  generated_ids, None
 
 
 def retrieve_logit_lens_llava(state, img_path, args, text_prompt = None):
     images_tensor, images, image_sizes = generate_images_tensor(
             state["model"], img_path, state["image_processor"]
     )
-    input_ids, output = run_llava_model(
+    input_ids, output, output_sequnce = run_llava_model(
         state["model"],
         state["model_name"],
         images_tensor,
@@ -351,8 +426,10 @@ def load_llava_state(rank):
     # Don't use device=..., pass directly to map loading
     device_str = f"cuda:{rank}"
     tokenizer, model, image_processor, context_len = load_pretrained_model(
-        model_path, None, model_name,  device_map=device_str, torch_dtype=torch.float16
+        model_path, None, model_name,  device_map=device_str, torch_dtype=torch.bfloat16 ,use_flash_attn=True
     )
+    # Convert entire model (including vision encoder & mm_projector) to bfloat16
+    model = model.to(torch.bfloat16)
 
     vocabulary = tokenizer.get_vocab()
     vocab_embeddings = get_vocab_embeddings_llava(model, tokenizer, device=f"cuda:{rank}")
@@ -384,3 +461,129 @@ def load_llava_state(rank):
         "model_name": model_name,
         "image_processor": image_processor,
     }
+
+
+
+import torch
+
+def get_device_from_module(module):
+    return next(module.parameters()).device
+
+def get_phrase_embedding(phrase, vocab_embeddings, tokenizer, remove_first=True):
+    # returns size (1, 5120)
+    text_embeddings = []
+    for token_id in tokenizer(phrase)["input_ids"]:
+        text_embeddings.append(vocab_embeddings[:, token_id])
+    if remove_first:
+        text_embeddings = text_embeddings[1:]
+    phrase_embedding = torch.sum(
+        torch.concat(text_embeddings), dim=0, keepdim=True
+    ) / len(text_embeddings)
+    return phrase_embedding
+
+
+def projection(image_embeddings, text_embedding):
+    return (image_embeddings @ text_embedding.T)[0, :, 0] / (
+        text_embedding @ text_embedding.T
+    ).squeeze()
+
+
+def subtract_projection(image_embeddings, text_embedding, weight=1, device = None):
+       # if device is None, don't move the embeddings to any device - keep their pre-existing device configs in tact
+    if device != None:
+        image_embeddings = image_embeddings.to(device)
+        text_embedding = text_embedding.to(device)
+    image_embeddings = image_embeddings.clone()
+    proj = projection(image_embeddings, text_embedding)
+    for i in range(image_embeddings.shape[1]):
+        if proj[i] > 0:
+            image_embeddings[:, i] += weight * proj[i] * text_embedding
+    return image_embeddings
+
+
+def subtract_projections(image_embeddings, text_embeddings, weight=1, device = None):
+    # text_embeddings: (# embeds, 1, # dim size)
+    # if device is None, don't move the embeddings to any device - keep their pre-existing device configs in tact
+    img_embeddings = image_embeddings.clone()
+    for text_embedding in text_embeddings:
+        img_embeddings = subtract_projection(img_embeddings, text_embedding, weight, device=device)
+    return img_embeddings
+
+
+
+
+def remove_all_hooks(model):
+    # Iterate over all modules in the model
+    for module in model.modules():
+        # Clear forward hooks
+        if hasattr(module, "_forward_hooks"):
+            module._forward_hooks.clear()
+        # Clear backward hooks (if any)
+        if hasattr(module, "_backward_hooks"):
+            module._backward_hooks.clear()
+        # Clear forward pre-hooks (if any)
+        if hasattr(module, "_forward_pre_hooks"):
+            module._forward_pre_hooks.clear()
+
+
+def generate_mass_edit_hook(
+    text_embeddings, start_edit_index, end_edit_index, layer, weight=1, minimum_size=32
+):
+    if len(text_embeddings) == 0:
+        print("No text embeddings found. Note that no editing will occur.")
+    def edit_embeddings(module, input, output):
+        device = get_device_from_module(module)
+        new_output = list(output)
+        if new_output[0].shape[1] > minimum_size:
+            print(f"Editing layer {layer}")
+            new_output[0][:, start_edit_index:end_edit_index] = subtract_projections(
+                new_output[0][:, start_edit_index:end_edit_index],
+                text_embeddings,
+                weight=weight,
+                device=device
+            )
+        return tuple(new_output)
+
+    return edit_embeddings
+
+
+def generate_mass_edit_pre_hook(
+    text_embeddings, start_edit_index, end_edit_index, layer, weight=1, minimum_size=32
+):
+    if len(text_embeddings) == 0:
+        print("No text embeddings found. Note that no editing will occur.")
+    def edit_embeddings(module, input):
+        device = get_device_from_module(module)
+        new_input = list(input)
+        if new_input[0].shape[1] > minimum_size:
+            print(f"Editing layer {layer}")
+            new_input[0][:, start_edit_index:end_edit_index] = subtract_projections(
+                new_input[0][:, start_edit_index:end_edit_index],
+                text_embeddings,
+                weight=weight,
+                device=device
+            )
+        return tuple(new_input)
+
+    return edit_embeddings
+
+
+def internal_confidence(tokenizer, softmax_probs, class_):
+    class_token_indices = tokenizer.encode(class_)[1:]
+    return softmax_probs[class_token_indices].max()
+
+
+def internal_confidence_heatmap(tokenizer, softmax_probs, class_):
+    class_token_indices = tokenizer.encode(class_)[1:]
+    return softmax_probs[class_token_indices].max(axis=0).T
+
+
+def internal_confidence_segmentation(tokenizer, softmax_probs, class_, num_patches=24):
+    class_token_indices = tokenizer.encode(class_)[1:]
+    return (
+        softmax_probs[class_token_indices]
+        .max(axis=0)
+        .max(axis=0)
+        .reshape(num_patches, num_patches)
+        .astype(float)
+    )

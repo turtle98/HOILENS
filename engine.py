@@ -200,9 +200,7 @@ class CustomisedDLE(DistributedLearningEngine):
                 for k, v in mAPs.items():
                     f.write(f"{k}: {v:.2f}\n")
                 f.write("\n")
-        if self._rank == 0:
-            if self._state.epoch % 5 == 0 or self._state.epoch == 1:
-                self.save_checkpoint()
+            self.save_checkpoint()
             #wandb.log(mAPs)
 
     @torch.no_grad()

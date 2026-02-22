@@ -308,9 +308,10 @@ def generate_llava_model(
             image_sizes=[image_sizes],
             do_sample=False,
             num_beams=1,
-            max_new_tokens=1024,
+            max_new_tokens=512,
             return_dict_in_generate=True,
             output_hidden_states=True,
+            output_scores = True
         )
 
     hidden = torch.stack(output.hidden_states[0])  # [layers+1, 1, seq_len, dim]
@@ -320,7 +321,7 @@ def generate_llava_model(
     generated_ids = output.sequences
     generated_text = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
 
-    return img_hidden_states, generated_text,  generated_ids, None
+    return img_hidden_states, generated_text,  generated_ids, torch.stack(output.scores, dim=0).squeeze(1)
 
 
 def retrieve_logit_lens_llava(state, img_path, args, text_prompt = None):

@@ -16,7 +16,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
 #import wandb
 from thop import profile
-from models.ours_llava_new_lora import build_detector
+from models.ours_llava_new_old import build_detector
 from utils.args import get_args
 import datetime
 

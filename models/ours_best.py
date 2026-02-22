@@ -695,8 +695,10 @@ class HOILLAVA(nn.Module):
             # logits_o = 1 - diffs_o
             # logits_h = 1 - diffs_h #+ logits_h[h_inverse_indices] + logits_o[o_inverse_indices]) /3
 
-            logits = (logits_h[h_inverse_indices] + logits_o[o_inverse_indices] + logits_ho)/3
 
+
+            logits = (logits_h[h_inverse_indices] + logits_o[o_inverse_indices] + logits_ho)/3
+    
             #logits = (ho_logits + h_logits[h_inverse_indices] + o_logits[o_inverse_indices])/3
 
             #asd = o_tokens @  self.lm_head_embeddings.T.to(hidden_states.device)

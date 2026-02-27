@@ -693,39 +693,41 @@ def vectorized_bboxes_and_indices(
     return filtered_bboxes, filtered_labels # filtered_patch_indices
 
 
-def bbox_to_token(size, boxes, token_grid_size=24):
+def bbox_to_token(size, boxes, grid_h, grid_w=None):
     """
     Args:
-        size: Tensor of shape (2,) - (height, width) for the image
-        boxes: Tensor of shape (B, 4) - absolute [x1, y1, x2, y2] box coordinates
-        token_grid_size: int - token grid resolution (e.g., 24 for 24x24)
+        size:   (height, width) of the image in pixels
+        boxes:  Tensor (B, 4) — absolute [x1, y1, x2, y2] coordinates
+        grid_h: number of token rows
+        grid_w: number of token columns (defaults to grid_h for square grids)
     Returns:
-        mask: Bool tensor of shape (B, token_grid_size * token_grid_size)
-              where True indicates the token is inside the box
+        mask: Bool tensor (B, grid_h * grid_w)
     """
+    if grid_w is None:
+        grid_w = grid_h
+
     B = boxes.shape[0]
     device = boxes.device
 
     img_h, img_w = size[0], size[1]
 
     # Normalize boxes to [0, 1]
-    norm_boxes = boxes.clone()
+    norm_boxes = boxes.clone().float()
     norm_boxes[:, [0, 2]] /= img_w
     norm_boxes[:, [1, 3]] /= img_h
 
-    # Convert to token grid indices
-    x1 = torch.clamp((norm_boxes[:, 0] * token_grid_size).floor().int(), 0, token_grid_size - 1)
-    y1 = torch.clamp((norm_boxes[:, 1] * token_grid_size).floor().int(), 0, token_grid_size - 1)
-    x2 = torch.clamp((norm_boxes[:, 2] * token_grid_size).floor().int(), 0, token_grid_size - 1)
-    y2 = torch.clamp((norm_boxes[:, 3] * token_grid_size).floor().int(), 0, token_grid_size - 1)
+    # Convert to token grid indices — x uses grid_w, y uses grid_h
+    x1 = torch.clamp((norm_boxes[:, 0] * grid_w).floor().int(), 0, grid_w - 1)
+    y1 = torch.clamp((norm_boxes[:, 1] * grid_h).floor().int(), 0, grid_h - 1)
+    x2 = torch.clamp((norm_boxes[:, 2] * grid_w).floor().int(), 0, grid_w - 1)
+    y2 = torch.clamp((norm_boxes[:, 3] * grid_h).floor().int(), 0, grid_h - 1)
 
-    # Token grid: [G, G]
-    #import pdb; pdb.set_trace()
-    rows = torch.arange(token_grid_size, device=device)
-    cols = torch.arange(token_grid_size, device=device)
-    grid_y, grid_x = torch.meshgrid(rows, cols, indexing='ij')  # [G, G]
-    grid_x = grid_x.unsqueeze(0)  # [1, G, G]
-    grid_y = grid_y.unsqueeze(0)  # [1, G, G]
+    # Token grid: [grid_h, grid_w]
+    rows = torch.arange(grid_h, device=device)
+    cols = torch.arange(grid_w, device=device)
+    grid_y, grid_x = torch.meshgrid(rows, cols, indexing='ij')  # [grid_h, grid_w]
+    grid_x = grid_x.unsqueeze(0)  # [1, grid_h, grid_w]
+    grid_y = grid_y.unsqueeze(0)  # [1, grid_h, grid_w]
 
     # Expand box coords to [B, 1, 1]
     x1 = x1.view(B, 1, 1)
@@ -733,8 +735,8 @@ def bbox_to_token(size, boxes, token_grid_size=24):
     x2 = x2.view(B, 1, 1)
     y2 = y2.view(B, 1, 1)
 
-    # Compute mask: [B, G, G]
+    # Compute mask: [B, grid_h, grid_w]
     mask = (grid_x >= x1) & (grid_x <= x2) & (grid_y >= y1) & (grid_y <= y2)
 
-    # Flatten token grid: [B, G*G]
+    # Flatten: [B, grid_h * grid_w]
     return mask.view(B, -1)

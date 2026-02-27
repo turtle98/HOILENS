@@ -6,7 +6,6 @@ The Australian National University
 Australian Centre for Robotic Vision
 """
 
-from entmax import sparsemax
 import os
 import sys
 from collections import defaultdict
@@ -17,7 +16,7 @@ import torch.distributed as dist
 from torch import Tensor
 from typing import Optional, List
 from torchvision.ops.boxes import batched_nms, box_iou
-
+import json
 import numpy as np
 import torchvision 
 #import wandb
@@ -261,10 +260,8 @@ class HOILLAVA(nn.Module):
         self.dataset = args.dataset
         self.reserve_indices = reserve_indices
 
-        self.lm_head_embeddings = torch.load("/home/taehoon/HOICLIP/training_linearshortcut/lm_head_embedding_7b.pt", "cpu")
-        self.verb_classifier_ho = torch.load("/home/taehoon/HOICLIP/training_linearshortcut/verb_classifier_weights_ho_7b.pt", "cpu").to(torch.bfloat16)
-        self.verb_classifier_h = torch.load("/home/taehoon/HOILENS/verb_classifier_ing.pt", "cpu").to(torch.bfloat16)
-        self.verb_classifier_o = torch.load("/home/taehoon/HOILENS/verb_classifier_ed.pt", "cpu").to(torch.bfloat16)
+        self.lm_head_embeddings = torch.load("/home/taehoonsong/HOILENS/tensors/lm_head_embedding_7b.pt", "cpu")
+        self.verb_classifier_ho = torch.load("/home/taehoonsong/HOILENS/tensors/verb_classifier_weights_ho_7b.pt", "cpu").to(torch.bfloat16)
         # self.verb_classifier_ho = F.normalize(self.verb_classifier_ho, p=2, dim=1)
         self.verb_projection_ho = nn.Linear(4096, 117, bias=False).to(torch.bfloat16)
         self.verb_projection_ho.weight.data = self.verb_classifier_ho
@@ -275,165 +272,148 @@ class HOILLAVA(nn.Module):
 
         if self.num_classes == 117:
             # 117 verbs × 3 forms each: (base, -ing, past)
-            verb_forms = [
-                'adjusting','assembling','blocking',
-                'blowing',
-                'boarding',
-                'breaking',
-                'brushing with',
-                'buying',
-                'carrying',
-                'catching',
-                'chasing',
-                'checking',
-                'cleaning',
-                'controlling',
-                'cooking',
-                'cutting',
-                'cutting with',
-                'directing',
-                'dragging',
-                'dribbling',
-                'drinking with',
-                'driving',
-                'drying',
-                'eating',
-                'eating at',
-                'exiting',
-                'feeding',
-                'filling',
-                'flipping',
-                'flushing',
-                'flying',
-                'greeting',
-                'grinding',
-                'grooming',
-                'herding',
-                'hitting',
-                'holding',
-                'hopping on',
-                'hosing',
-                'hugging',
-                'hunting',
-                'inspecting',
-                'installing',
-                'jumping',
-                'kicking',
-                'kissing',
-                'lassoing',
-                'launching',
-                'licking',
-                'lying on',
-                'lifting',
-                'lighting',
-                'loading',
-                'losing',
-                'making',
-                'milking',
-                'moving',
-                'no interaction',
-                'opening',
-                'operating',
-                'packing',
-                'painting',
-                'parking',
-                'paying',
-                'peeling',
-                'petting',
-                'picking',
-                'picking up',
-                'pointing',
-                'pouring',
-                'pulling',
-                'pushing',
-                'racing',
-                'reading',
-                'releasing',
-                'repairing',
-                'riding',
-                'rowing',
-                'running',
-                'sailing',
-                'scratching',
-                'serving',
-                'setting',
-                'shearing',
-                'signing',
-                'sipping',
-                'sitting at',
-                'sitting on',
-                'sliding',
-                'smelling',
-                'spinning',
-                'squeezing',
-                'stabbing',
-                'standing on',
-                'standing under',
-                'sticking',
-                'stirring',
-                'stopping at',
-                'straddling',
-                'swinging',
-                'tagging',
-                'talking on',
-                'teaching',
-                'texting on',
-                'throwing',
-                'tying',
-                'toasting',
-                'training',
-                'turning',
-                'typing on',
-                'walking',
-                'washing',
-                'watching',
-                'waving',
-                'wearing',
-                'wielding',
-                'zipping',
+            verb_forms_3 = [
+                ('adjust',         'adjusting',      'adjusted'),
+                ('assemble',       'assembling',     'assembled'),
+                ('block',          'blocking',       'blocked'),
+                ('blow',           'blowing',        'blew'),
+                ('board',          'boarding',       'boarded'),
+                ('break',          'breaking',       'broke'),
+                ('brush with',     'brushing with',  'brushed with'),
+                ('buy',            'buying',         'bought'),
+                ('carry',          'carrying',       'carried'),
+                ('catch',          'catching',       'caught'),
+                ('chase',          'chasing',        'chased'),
+                ('check',          'checking',       'checked'),
+                ('clean',          'cleaning',       'cleaned'),
+                ('control',        'controlling',    'controlled'),
+                ('cook',           'cooking',        'cooked'),
+                ('cut',            'cutting',        'cut'),
+                ('cut with',       'cutting with',   'cut with'),
+                ('direct',         'directing',      'directed'),
+                ('drag',           'dragging',       'dragged'),
+                ('dribble',        'dribbling',      'dribbled'),
+                ('drink with',     'drinking with',  'drank with'),
+                ('drive',          'driving',        'drove'),
+                ('dry',            'drying',         'dried'),
+                ('eat',            'eating',         'ate'),
+                ('eat at',         'eating at',      'ate at'),
+                ('exit',           'exiting',        'exited'),
+                ('feed',           'feeding',        'fed'),
+                ('fill',           'filling',        'filled'),
+                ('flip',           'flipping',       'flipped'),
+                ('flush',          'flushing',       'flushed'),
+                ('fly',            'flying',         'flew'),
+                ('greet',          'greeting',       'greeted'),
+                ('grind',          'grinding',       'ground'),
+                ('groom',          'grooming',       'groomed'),
+                ('herd',           'herding',        'herded'),
+                ('hit',            'hitting',        'hit'),
+                ('hold',           'holding',        'held'),
+                ('hop on',         'hopping on',     'hopped on'),
+                ('hose',           'hosing',         'hosed'),
+                ('hug',            'hugging',        'hugged'),
+                ('hunt',           'hunting',        'hunted'),
+                ('inspect',        'inspecting',     'inspected'),
+                ('install',        'installing',     'installed'),
+                ('jump',           'jumping',        'jumped'),
+                ('kick',           'kicking',        'kicked'),
+                ('kiss',           'kissing',        'kissed'),
+                ('lasso',          'lassoing',       'lassoed'),
+                ('launch',         'launching',      'launched'),
+                ('lick',           'licking',        'licked'),
+                ('lie on',         'lying on',       'lay on'),
+                ('lift',           'lifting',        'lifted'),
+                ('light',          'lighting',       'lit'),
+                ('load',           'loading',        'loaded'),
+                ('lose',           'losing',         'lost'),
+                ('make',           'making',         'made'),
+                ('milk',           'milking',        'milked'),
+                ('move',           'moving',         'moved'),
+                ('no interaction', 'no interaction', 'no interaction'),
+                ('open',           'opening',        'opened'),
+                ('operate',        'operating',      'operated'),
+                ('pack',           'packing',        'packed'),
+                ('paint',          'painting',       'painted'),
+                ('park',           'parking',        'parked'),
+                ('pay',            'paying',         'paid'),
+                ('peel',           'peeling',        'peeled'),
+                ('pet',            'petting',        'petted'),
+                ('pick',           'picking',        'picked'),
+                ('pick up',        'picking up',     'picked up'),
+                ('point',          'pointing',       'pointed'),
+                ('pour',           'pouring',        'poured'),
+                ('pull',           'pulling',        'pulled'),
+                ('push',           'pushing',        'pushed'),
+                ('race',           'racing',         'raced'),
+                ('read',           'reading',        'read'),
+                ('release',        'releasing',      'released'),
+                ('repair',         'repairing',      'repaired'),
+                ('ride',           'riding',         'rode'),
+                ('row',            'rowing',         'rowed'),
+                ('run',            'running',        'ran'),
+                ('sail',           'sailing',        'sailed'),
+                ('scratch',        'scratching',     'scratched'),
+                ('serve',          'serving',        'served'),
+                ('set',            'setting',        'set'),
+                ('shear',          'shearing',       'sheared'),
+                ('sign',           'signing',        'signed'),
+                ('sip',            'sipping',        'sipped'),
+                ('sit at',         'sitting at',     'sat at'),
+                ('sit on',         'sitting on',     'sat on'),
+                ('slide',          'sliding',        'slid'),
+                ('smell',          'smelling',       'smelled'),
+                ('spin',           'spinning',       'spun'),
+                ('squeeze',        'squeezing',      'squeezed'),
+                ('stab',           'stabbing',       'stabbed'),
+                ('stand on',       'standing on',    'stood on'),
+                ('stand under',    'standing under', 'stood under'),
+                ('stick',          'sticking',       'stuck'),
+                ('stir',           'stirring',       'stirred'),
+                ('stop at',        'stopping at',    'stopped at'),
+                ('straddle',       'straddling',     'straddled'),
+                ('swing',          'swinging',       'swung'),
+                ('tag',            'tagging',        'tagged'),
+                ('talk on',        'talking on',     'talked on'),
+                ('teach',          'teaching',       'taught'),
+                ('text on',        'texting on',     'texted on'),
+                ('throw',          'throwing',       'threw'),
+                ('tie',            'tying',          'tied'),
+                ('toast',          'toasting',       'toasted'),
+                ('train',          'training',       'trained'),
+                ('turn',           'turning',        'turned'),
+                ('type on',        'typing on',      'typed on'),
+                ('walk',           'walking',        'walked'),
+                ('wash',           'washing',        'washed'),
+                ('watch',          'watching',       'watched'),
+                ('wave',           'waving',         'waved'),
+                ('wear',           'wearing',        'wore'),
+                ('wield',          'wielding',       'wielded'),
+                ('zip',            'zipping',        'zipped'),
             ]
             tokenizer = self.clip_head['tokenizer']
-            verb_token_ids = []
-            for form in verb_forms:
-                ids = tokenizer.encode(form)[1:]  # skip BOS
-                ids = list(dict.fromkeys(ids))  # deduplicate preserving order
-                verb_token_ids.append(ids)
+            # Build per-verb, per-form token id lists: [num_verbs, 3, variable]
+            all_form_ids = []
+            for triple in verb_forms_3:
+                form_ids = []
+                for form in triple:
+                    ids = tokenizer.encode(form)[1:]  # skip BOS
+                    ids = list(dict.fromkeys(ids))     # deduplicate preserving order
+                    form_ids.append(ids)
+                all_form_ids.append(form_ids)
 
-            num_verbs = len(verb_forms)
-            max_tokens = max(len(ids) for ids in verb_token_ids)
-            # Pad with 0 and create mask
-            padded = torch.zeros(num_verbs, max_tokens, dtype=torch.long)
-            mask = torch.zeros(num_verbs, max_tokens, dtype=torch.bool)
-            for i, ids in enumerate(verb_token_ids):
-                padded[i, :len(ids)] = torch.tensor(ids)
-                mask[i, :len(ids)] = True
-            self.register_buffer('verb_token_ids', padded)      # [num_verbs, max_tokens]
-            self.register_buffer('verb_token_mask', mask)
+            num_verbs = len(verb_forms_3)
+            max_tokens = max(len(ids) for form_ids in all_form_ids for ids in form_ids)
+            # Pad to [num_verbs, 3, max_tokens]
+            padded = torch.zeros(num_verbs, 3, max_tokens, dtype=torch.long)
+            mask   = torch.zeros(num_verbs, 3, max_tokens, dtype=torch.bool)
+            for i, form_ids in enumerate(all_form_ids):
+                for j, ids in enumerate(form_ids):
+                    padded[i, j, :len(ids)] = torch.tensor(ids)
+                    mask[i, j, :len(ids)]   = True
+            self.register_buffer('verb_token_ids',  padded)  # [117, 3, max_tokens]
+            self.register_buffer('verb_token_mask', mask)    # [117, 3, max_tokens]
 
-        # # Build all_verb_forms from WordNet: every unique verb lemma
-        # all_verbs = sorted(set(
-        #     lemma.name().replace('_', ' ')
-        #     for synset in wn.all_synsets(pos=wn.VERB)
-        #     for lemma in synset.lemmas()
-        # ))
-        # tokenizer = self.clip_head['tokenizer']
-        # all_verb_token_ids = []
-        # for verb in all_verbs:
-        #     ids = tokenizer.encode(verb)[1:]  # skip BOS
-        #     ids = list(dict.fromkeys(ids))    # deduplicate preserving order
-        #     all_verb_token_ids.append(ids)
-
-        # num_all_verbs = len(all_verbs)
-        # max_all_tokens = max(len(ids) for ids in all_verb_token_ids)
-        # all_verb_padded = torch.zeros(num_all_verbs, max_all_tokens, dtype=torch.long)
-        # all_verb_mask = torch.zeros(num_all_verbs, max_all_tokens, dtype=torch.bool)
-        # for i, ids in enumerate(all_verb_token_ids):
-        #     all_verb_padded[i, :len(ids)] = torch.tensor(ids)
-        #     all_verb_mask[i, :len(ids)] = True
-        # self.register_buffer('all_verb_token_ids', all_verb_padded)    # [num_all_verbs, max_all_tokens]
-        # self.register_buffer('all_verb_token_mask', all_verb_mask)
-        # self.all_verb_names = all_verbs  # keep string list for reference
-        # print(f"Loaded {num_all_verbs} unique WordNet verbs, max {max_all_tokens} tokens")
 
         if self.num_classes == 600:
             tokenizer = self.clip_head['tokenizer']
@@ -507,6 +487,9 @@ class HOILLAVA(nn.Module):
             nn.Linear(128, 256), nn.ReLU(),
             nn.Linear(256, 4096), nn.ReLU(),
         ).to(torch.bfloat16)
+
+
+        #self.pair_features = MLP(4096*2, 512, )
 
     def _reset_parameters(self):  ## xxx
         for p in self.context_aware.parameters():
@@ -699,8 +682,8 @@ class HOILLAVA(nn.Module):
             bool_h_inverse = bbox_2_tokens[h_inverse_indices]  # [num_unique_o, 576]
            # import pdb; pdb.set_trace()
             #import pdb;pdb.set_trace()
-            h_out = self.cross_attend_lora_h(h_feats0 + h_detr_feats + self.object_embedding[labels[h_unique_indices]].to(torch.bfloat16), llava_context_list)
-            o_out= self.cross_attend_lora_o(o_feats0+ o_detr_feats + self.object_embedding[labels[o_unique_indices]].to(torch.bfloat16), llava_context_list)
+            h_out = self.cross_attend_lora_h(h_feats0[0][h_inverse_indices].unsqueeze(0) + h_detr_feats[h_inverse_indices] + self.object_embedding[labels[h_inverse_indices]].to(torch.bfloat16), llava_context_list, bool_o_inverse)
+            o_out= self.cross_attend_lora_o(o_feats0[0][o_inverse_indices].unsqueeze(0)+ o_detr_feats[o_inverse_indices] + self.object_embedding[labels[o_inverse_indices]].to(torch.bfloat16), llava_context_list, bool_h_inverse)
             #ho_feats0 = (h_feats0[0][h_inverse_indices].unsqueeze(0) + o_feats0[0][o_inverse_indices].unsqueeze(0)) /2
             ho_out= self.cross_attend_lora_ho(ho_feats0 + ho_detr_feats + pairwise_spatial_reshaped + self.object_embedding[labels[o_inverse_indices]].to(torch.bfloat16)+ self.object_embedding[labels[h_inverse_indices]].to(torch.bfloat16), llava_context_list)
             normed_h = self.final_norm(h_out.squeeze(0))
@@ -716,75 +699,81 @@ class HOILLAVA(nn.Module):
             ho_vocab = normed_ho @ centered_lm_head
 
 
-            # ref_ho = ho_feats0 @ centered_lm_head
-            # ref_h = h_feats0 @ centered_lm_head
-
-            # torch.topk(ref_ho, k=128, dim=-1).values
-
-            topk_ho_vocab = torch.topk(ho_vocab, k=128, dim=-1).values
-            topk_h_vocab = torch.topk(h_vocab, k=128, dim=-1).values
-            topk_o_vocab = torch.topk(o_vocab, k=128, dim=-1).values
 
 
             all_probs_ho = F.softmax(ho_vocab, dim=-1)
             all_probs_h = F.softmax(h_vocab, dim=-1)
             all_probs_o = F.softmax(o_vocab, dim=-1)
 
-            log_probs = F.log_softmax(ho_vocab, dim=-1)
-            entropy_ho  = -(all_probs_ho * log_probs).sum(-1)
-
-            log_probs_o = F.log_softmax(o_vocab, dim=-1)
-            entropy_o= -(all_probs_o * log_probs_o).sum(-1)
 
 
-            log_probs_h = F.log_softmax(h_vocab, dim=-1)
-            entropy_h  = -(all_probs_h * log_probs_h).sum(-1)
+            ho_vocab_weighted_mean = (all_probs_ho * ho_vocab).sum(-1)#.detach()
+            h_vocab_weighted_mean = (all_probs_h * h_vocab).sum(-1)#.detach()
+            o_vocab_weighted_mean = (all_probs_o * o_vocab).sum(-1)#.detach()
 
 
 
-            ho_vocab_weighted_mean = (all_probs_ho * ho_vocab).sum(-1)
-            h_vocab_weighted_mean = (all_probs_h * h_vocab).sum(-1)
-            o_vocab_weighted_mean = (all_probs_o * o_vocab).sum(-1)
+            #max_entropy = math.log(ho_vocab.shape[-1])
 
 
-
-            max_entropy = math.log(ho_vocab.shape[-1])
-
-
-            ho_conf = torch.exp(-entropy_ho / max_entropy)   # [N_ho]
-            h_conf  = torch.exp(-entropy_h  / max_entropy)   # [N_h]
-            o_conf  = torch.exp(-entropy_o  / max_entropy)   # [N_o]
+            # ho_conf = torch.exp(-entropy_ho / max_entropy)   # [N_ho]
+            # h_conf  = torch.exp(-entropy_h  / max_entropy)   # [N_h]
+            # o_conf  = torch.exp(-entropy_o  / max_entropy)   # [N_o]
 
 
-            if self.num_classes == 600:
-                h_hoi_scores = h_vocab[:, self.hoi_token_ids]  
-                h_hoi_scores = h_hoi_scores.masked_fill(~self.hoi_token_mask.unsqueeze(0), 0.0)
-                logits_h = h_hoi_scores.sum(dim=-1) / self.hoi_token_mask.sum(dim=-1).unsqueeze(0) #+ lens_per_pair[-1] # [N, 117]
+            if self.num_classes == 117:
+                # verb_token_ids/mask: [117, 3, max_tokens]
+                # Index vocab -> [N, 117, 3, max_tokens], average over tokens per form,
+                # then take max across the 3 forms (base, -ing, past) -> [N, 117]
+                form_counts = self.verb_token_mask.sum(dim=-1).unsqueeze(0).clamp(min=1)  # [1, 117, 3]
 
-                o_hoi_scores = o_vocab[:, self.hoi_token_ids]
-                o_hoi_scores = o_hoi_scores.masked_fill(~self.hoi_token_mask.unsqueeze(0), 0.0)
-                logits_o = o_hoi_scores.sum(dim=-1) / self.hoi_token_mask.sum(dim=-1).unsqueeze(0)
+                h_verb_scores = h_vocab[:, self.verb_token_ids]  # [N, 117, 3, max_tokens]
+                h_verb_scores = h_verb_scores.masked_fill(~self.verb_token_mask.unsqueeze(0), 0.0)
+                h_verb_avg = (h_verb_scores.sum(dim=-1) / form_counts).max(dim=-1).values  # [N, 117]
 
-                ho_hoi_scores = ho_vocab[:, self.hoi_token_ids]
-                ho_hoi_scores = ho_hoi_scores.masked_fill(~self.hoi_token_mask.unsqueeze(0), 0.0)
-                logits_ho = ho_hoi_scores.sum(dim=-1) / self.hoi_token_mask.sum(dim=-1).unsqueeze(0)
+                o_verb_scores = o_vocab[:, self.verb_token_ids]  # [N, 117, 3, max_tokens]
+                o_verb_scores = o_verb_scores.masked_fill(~self.verb_token_mask.unsqueeze(0), 0.0)
+                o_verb_avg = (o_verb_scores.sum(dim=-1) / form_counts).max(dim=-1).values  # [N, 117]
+
+                ho_verb_scores = ho_vocab[:, self.verb_token_ids]  # [N, 117, 3, max_tokens]
+                ho_verb_scores = ho_verb_scores.masked_fill(~self.verb_token_mask.unsqueeze(0), 0.0)
+                ho_verb_avg = (ho_verb_scores.sum(dim=-1) / form_counts).max(dim=-1).values  # [N, 117]
+            #     # Synonym token scores: [N, 117, 5, max_syn_len]
+            #     h_syn_scores = h_vocab[:, self.synonym_token_ids]
+            #     h_syn_scores = h_syn_scores.masked_fill(~self.synonym_token_mask.unsqueeze(0), 0.0)
+            #     h_syn_avg = h_syn_scores.sum(dim=-1) / self.synonym_token_mask.sum(dim=-1).unsqueeze(0).clamp(min=1)  # [N, 117, 5]
+            #     h_syn_avg = h_syn_avg.mean(dim=-1)  # [N, 117]
+
+            #     o_syn_scores = o_vocab[:, self.synonym_token_ids]
+            #     o_syn_scores = o_syn_scores.masked_fill(~self.synonym_token_mask.unsqueeze(0), 0.0)
+            #     o_syn_avg = o_syn_scores.sum(dim=-1) / self.synonym_token_mask.sum(dim=-1).unsqueeze(0).clamp(min=1)  # [N, 117, 5]
+            #     o_syn_avg = o_syn_avg.mean(dim=-1)  # [N, 117]
+
+            #     ho_syn_scores = ho_vocab[:, self.synonym_token_ids]
+            #     ho_syn_scores = ho_syn_scores.masked_fill(~self.synonym_token_mask.unsqueeze(0), 0.0)
+            #     ho_syn_avg = ho_syn_scores.sum(dim=-1) / self.synonym_token_mask.sum(dim=-1).unsqueeze(0).clamp(min=1)  # [N, 117, 5]
+            #     ho_syn_avg = ho_syn_avg.mean(dim=-1)  # [N, 117]
+
+            #     logits_h = (h_verb_avg + h_syn_avg) / 2
+            #     logits_o = (o_verb_avg + o_syn_avg) / 2
+            #     logits_ho = (ho_verb_avg + ho_syn_avg) /2 
 
 
-            # probs_ho = torch.sigmoid(self.verb_projection_ho(normed_ho).unsqueeze(-1) - topk_ho_vocab.unsqueeze(1)).mean(-1) * ho_conf.unsqueeze(-1)#-  #- normed_ho @ self.mu.T #- global_logit
-            # probs_h = torch.sigmoid(self.verb_projection_ho(normed_h).unsqueeze(-1) - topk_h_vocab.unsqueeze(1)).mean(-1) * h_conf.unsqueeze(-1)#torch.log(torch.sigmoid(self.verb_projection_ho(normed_h).unsqueeze(-1) - topk_h_vocab.unsqueeze(1)).sum(-1)) / torch.log(torch.tensor(100.0)) #-  #- normed_ho @ self.mu.T #- global_logit #- normed_h @ self.mu.T  #- global_logit
-            # probs_o = torch.sigmoid(self.verb_projection_ho(normed_o).unsqueeze(-1) - topk_o_vocab.unsqueeze(1)).mean(-1) * o_conf.unsqueeze(-1) #torch.log(torch.sigmoid(self.verb_projection_ho(normed_o).unsqueeze(-1) - topk_o_vocab.unsqueeze(1)).sum(-1)) / torch.log(torch.tensor(100.0)) #-  #- normed_ho @ self.mu.T #- global_logit #- normed_o @ self.mu.T #- global_logit
-            #probs_ho =  torch.sigmoid(self.verb_projection_ho(normed_ho)- ho_vocab_weighted_mean.unsqueeze(-1)) * ho_conf.unsqueeze(-1)#-  #- normed_ho @ self.mu.T #- global_logit
-            #probs_h =  torch.sigmoid(self.verb_projection_ho(normed_h)- h_vocab_weighted_mean.unsqueeze(-1))* h_conf.unsqueeze(-1)#-  #- normed_ho @ self.mu.T #- global_logit
-            #probs_o =  torch.sigmoid(self.verb_projection_ho(normed_o)- o_vocab_weighted_mean.unsqueeze(-1))* o_conf.unsqueeze(-1)#-  #- normed_ho @ self.mu.T #- global_logit#self.verb_projection_ho(ref_h_feats0)
-            # #self.verb_projection_ho(ref_ho_feats0)
+            #probs_ho = self.verb_projection_ho(normed_ho) #- topk_ho_vocab.unsqueeze(1)).mean(-1) * ho_conf.unsqueeze(-1)#-  #- normed_ho @ self.mu.T #- global_logit
+            #probs_h = self.verb_projection_ho(normed_h) #- topk_h_vocab.unsqueeze(1)).mean(-1) * h_conf.unsqueeze(-1)#torch.log(torch.sigmoid(self.verb_projection_ho(normed_h).unsqueeze(-1) - topk_h_vocab.unsqueeze(1)).sum(-1)) / torch.log(torch.tensor(100.0)) #-  #- normed_ho @ self.mu.T #- global_logit #- normed_h @ self.mu.T  #- global_logit
+            #probs_o = self.verb_projection_ho(normed_o) #- topk_o_vocab.unsqueeze(1)).mean(-1) * o_conf.unsqueeze(-1) #torch.log(torch.sigmoid(self.verb_projection_ho(normed_o).unsqueeze(-1) - topk_o_vocab.unsqueeze(1)).sum(-1)) / torch.log(torch.tensor(100.0)) #-  #- normed_ho @ self.mu.T #- global_logit #- normed_o @ self.mu.T #- global_logit
+            # probs_ho =  torch.sigmoid(self.verb_projection_ho(normed_ho)- ho_vocab_weighted_mean.unsqueeze(-1)) #* ho_conf.unsqueeze(-1)#-  #- normed_ho @ self.mu.T #- global_logit
+            # probs_h =  torch.sigmoid(self.verb_projection_ho(normed_h)- h_vocab_weighted_mean.unsqueeze(-1))#* h_conf.unsqueeze(-1)#-  #- normed_ho @ self.mu.T #- global_logit
+            # probs_o =  torch.sigmoid(self.verb_projection_ho(normed_o)- o_vocab_weighted_mean.unsqueeze(-1))#* o_conf.unsqueeze(-1)#-  #- normed_ho @ self.mu.T #- global_logit#self.verb_projection_ho(ref_h_feats0)
+            #self.verb_projection_ho(ref_ho_feats0)
             #import pdb; pdb.set_trace()
-            probs_ho = torch.sigmoid(logits_ho - ho_vocab_weighted_mean.unsqueeze(-1)) #-  #- normed_ho @ self.mu.T #- global_logit
-            probs_h = torch.sigmoid(logits_h - h_vocab_weighted_mean.unsqueeze(-1))#torch.log(torch.sigmoid(self.verb_projection_ho(normed_h).unsqueeze(-1) - topk_h_vocab.unsqueeze(1)).sum(-1)) / torch.log(torch.tensor(100.0)) #-  #- normed_ho @ self.mu.T #- global_logit #- normed_h @ self.mu.T  #- global_logit
-            probs_o = torch.sigmoid(logits_o - o_vocab_weighted_mean.unsqueeze(-1))#.mean(-1) #torch.log(torch.sigmoid(self.verb_projection_ho(normed_o).unsqueeze(-1) - topk_o_vocab.unsqueeze(1)).sum(-1)) / torch.log(torch.tensor(100.0)) #-  #- normed_ho @ self.mu.T #- global_logit #- normed_o @ self.mu.T #- global_logit
-            #probs_o =  torch.sigmoid(self.verb_projection_ho(normed_o) - o_vocab_weighted_mean.unsqueeze(-1))
+            probs_ho = torch.sigmoid(ho_verb_avg - ho_vocab_weighted_mean.unsqueeze(-1)) #-  #- normed_ho @ self.mu.T #- global_logit
+            probs_h = torch.sigmoid(h_verb_avg - h_vocab_weighted_mean.unsqueeze(-1))#torch.log(torch.sigmoid(self.verb_projection_ho(normed_h).unsqueeze(-1) - topk_h_vocab.unsqueeze(1)).sum(-1)) / torch.log(torch.tensor(100.0)) #-  #- normed_ho @ self.mu.T #- global_logit #- normed_h @ self.mu.T  #- global_logit
+            probs_o = torch.sigmoid(o_verb_avg - o_vocab_weighted_mean.unsqueeze(-1))#.mean(-1) #torch.log(torch.sigmoid(self.verb_projection_ho(normed_o).unsqueeze(-1) - topk_o_vocab.unsqueeze(1)).sum(-1)) / torch.log(torch.tensor(100.0)) #-  #- normed_ho @ self.mu.T #- global_logit #- normed_o @ self.mu.T #- global_logit
+            # #probs_o =  torch.sigmoid(self.verb_projection_ho(normed_o) - o_vocab_weighted_mean.unsqueeze(-1))
             #logits = (probs_h[h_inverse_indices] + probs_o[o_inverse_indices] + probs_ho) / 3
            # F.softmax(topk_h_vocab, dim =-1)
-            logits = (probs_h[h_inverse_indices] + probs_o[o_inverse_indices]+ probs_ho) / 3
+            logits = (probs_h + probs_o+ probs_ho) / 3
             #logits= (probs_h[h_inverse_indices] + probs_o[o_inverse_indices])/2
             #import pdb; pdb.set_trace()
 
@@ -794,10 +783,10 @@ class HOILLAVA(nn.Module):
             prior_collated.append(self.compute_prior_scores(
                 x_keep, y_keep, scores, labels)
             )
-            #gt_labels = torch.ones([N])torch.sigmoid(logits)torch.sigmoid(logits) torch.topk(ho_vocab[5], 100, dim=-1)[0]
+            #gt_labels = torch.ones([N])torch.sigmoid(logits)torch.sigmoid(logits) torch.topk(ho_vocab[3], 100, dim=-1)[0]
             all_logits_collated.append(logits)
-            # print(self.clip_head['tokenizer'].decode(torch.topk(ho_vocab[0], 100, dim=-1)[1]))
-            # print(self.clip_head['tokenizer'].decode(torch.topk(h_vocab[h_inverse_indices][0], 100, dim=-1)[1]))
+            # print(self.clip_head['tokenizer'].decode(torch.topk(ho_vocab[5], 100, dim=-1)[1]))
+            # print(self.clip_head['tokenizer'].decode(torch.topk(h_vocab[h_inverse_indices][9], 100, dim=-1)[1]))
             # print(self.clip_head['tokenizer'].decode(torch.topk(o_vocab[o_inverse_indices][0], 100, dim=-1)[1]))
             #torch.topk(o_vocab[7], 100, dim=-1)[0]
           
@@ -1060,7 +1049,7 @@ def build_detector(args, class_corr, object_n_verb_to_interaction, clip_model_pa
     #model = CustomCLIP(args, classnames=classnames, clip_model=clip_model)
 
     obj_class_names = [obj[1] for obj in hico_text_label.hico_obj_text_label]
-    object_embedding = torch.load("/home/taehoon/HOICLIP/training_linearshortcut/obj_classifier_7b.pt", "cpu")
+    object_embedding = torch.load("/home/taehoonsong/HOILENS/tensors/obj_classifier_7b.pt", "cpu")
     object_embedding = object_embedding.clone().detach()
 
 

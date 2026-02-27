@@ -34,7 +34,7 @@ class DataFactory(Dataset):
         if self.clip_model_name == 'ViT-B/16':
             self.clip_input_resolution = 224
         elif self.clip_model_name == 'ViT-L/14@336px':
-            self.clip_input_resolution = 336
+            self.clip_input_resolution = 448
 
         if name == 'hicodet':
             assert partition in ['train2015', 'test2015'], \
@@ -202,14 +202,5 @@ class DataFactory(Dataset):
         image, _ = self.normalize(image, None)
         image_clip, target = self.clip_normalize(image_clip, target)
         target['filename'] = filename
-        # if "train" in target['filename']:
-        #     filename_wo_ext = os.path.splitext(target['filename'])[0]
-        #     llava_feature_path = os.path.join(self.llava_feature_dir,'train', f"{filename_wo_ext}.pt")
-        #     llava_feature = torch.load(llava_feature_path)  
-        # else:
-        #     filename_wo_ext = os.path.splitext(target['filename'])[0]
-        #     llava_feature_path = os.path.join(self.llava_feature_dir,'test', f"{filename_wo_ext}.pt")
-        #     llava_feature = torch.load(llava_feature_path)  
         target['filename_num'] = torch.tensor(int(filename.split('.')[0].split('_')[-1]))
-        #target['llava_feat'] = llava_feature
-        return (image,image_clip), target
+        return (image, image_clip), target

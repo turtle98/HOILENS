@@ -200,5 +200,6 @@ def get_args():
     parser.add_argument('--few_shot', action='store_true', help='')
     parser.add_argument('--focus', action='store_true', help='')
     parser.add_argument('--attn_mod', action='store_true', help='')
+    parser.add_argument('--per_class_ap', action='store_true', help='Save per-class AP to eval log')
 
     return parser.parse_args()

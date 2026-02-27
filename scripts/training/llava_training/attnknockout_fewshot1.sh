@@ -2,14 +2,14 @@
 
 let port=$RANDOM%5000+5000
 let id=$RANDOM%5000+5000
-gpu_num=3
+gpu_num=1
 WANDB__SERVICE_WAIT=300
-CUDA_VISIBLE_DEVICES=4,5,6 torchrun --rdzv_id $id --rdzv_backend=c10d --nproc_per_node=$gpu_num --rdzv_endpoint=127.0.0.1:$port \
+CUDA_VISIBLE_DEVICES=4 torchrun --rdzv_id $id --rdzv_backend=c10d --nproc_per_node=$gpu_num --rdzv_endpoint=127.0.0.1:$port \
          main_llava_training.py --pretrained checkpoints/pretrained_detr/detr-r50-hicodet.pth --clip_dir_vit checkpoints/pretrained_clip/ViT-L-14-336px.pt --output-dir /home/taehoon/HOILENS/checkpoints/ECCV/train/0217/UV/ours_new_3branch_lora_rank16_31_withdetr_withspatialho_noattnmask_verbprojection_128 \
-         --dataset hicodet --num_classes 600 --num-workers 4 \
+         --dataset hicodet --num_classes 117 --num-workers 4 \
          --epochs 20  --zs --zs_type unseen_verb --lr-head 1e-3 --lr-lora 1e-4 --lr-drop 10 \
          --adapt_dim 128 --batch-size 4 --start_idx 1 --end_idx 32 \
-         --print-interval 100 --layer 30 --eval --resume /home/taehoon/HOILENS/checkpoints/ECCV/train/0222/NRF/ours_new_all3branch_twolayer_lora_rank16_31_withdetr_withspatialho_noattnmask_uniqueonlyforhando_weightedmeanforallvocab_noklloss_epoch30_drop15_noqueryselfattnadded_objclassadded_withentropyconf/ckpt_04156_04.pt
+         --print-interval 100 --layer 30 --eval #--resume /home/taehoon/HOILENS/checkpoints/ECCV/train/0222/NRF/ours_new_all3branch_twolayer_lora_rank16_31_withdetr_withspatialho_noattnmask_uniqueonlyforhando_weightedmeanforallvocab_noklloss_epoch30_drop15_noqueryselfattnadded_objclassadded_withentropyconf/ckpt_04156_04.pt
 
 # CUDA_VISIBLE_DEVICES=4,5 torchrun --rdzv_id $id --rdzv_backend=c10d --nproc_per_node=$gpu_num --rdzv_endpoint=127.0.0.1:$port \
 #          main_llava_training.py --pretrained checkpoints/pretrained_detr/detr-r50-hicodet.pth --clip_dir_vit checkpoints/pretrained_clip/ViT-L-14-336px.pt --output-dir /home/taehoon/HOILENS/checkpoints/ECCV/train/0216/RF/ours_new_2branch_h_o_lora_rank32_31_withdetr_attnmask_verbprojection_256_gpu2 \

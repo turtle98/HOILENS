@@ -50,6 +50,7 @@ import math
 import random
 
 import copy
+import json
 import nltk
 from nltk import word_tokenize, pos_tag
 nltk.download('punkt_tab')
@@ -402,6 +403,45 @@ class HOILLAVA(nn.Module):
             self.register_buffer('verb_token_ids', padded)      # [num_verbs, max_tokens]
             self.register_buffer('verb_token_mask', mask)
 
+            # Load verb synonyms and register as buffers
+            with open("/home/taehoonsong/HOILENS/verb_synonyms_5.json", "r") as f:
+                verb_synonyms = json.load(f)
+
+            num_synonyms = 5  # each verb has 5 synonyms
+            syn_token_ids_list = []   # [num_verbs, num_synonyms, max_syn_tokens]
+            syn_token_mask_list = []
+
+            for verb in verb_forms:
+                syns = verb_synonyms.get(verb, [""] * num_synonyms)
+                syns = (syns + [""] * num_synonyms)[:num_synonyms]  # pad/truncate to 5
+                syn_ids = []
+                for s in syns:
+                    ids = tokenizer.encode(s, add_special_tokens=False) if s else []
+                    ids = list(dict.fromkeys(ids))  # deduplicate preserving order
+                    syn_ids.append(ids)
+
+                max_syn_tokens = max((len(ids) for ids in syn_ids), default=1)
+                syn_padded = torch.zeros(num_synonyms, max_syn_tokens, dtype=torch.long)
+                syn_mask = torch.zeros(num_synonyms, max_syn_tokens, dtype=torch.bool)
+                for i, ids in enumerate(syn_ids):
+                    if ids:
+                        syn_padded[i, :len(ids)] = torch.tensor(ids)
+                        syn_mask[i, :len(ids)] = True
+                syn_token_ids_list.append(syn_padded)
+                syn_token_mask_list.append(syn_mask)
+
+            # Pad across verbs to a common max_syn_tokens
+            max_syn_len = max(t.shape[1] for t in syn_token_ids_list)
+            syn_ids_padded = torch.zeros(num_verbs, num_synonyms, max_syn_len, dtype=torch.long)
+            syn_mask_padded = torch.zeros(num_verbs, num_synonyms, max_syn_len, dtype=torch.bool)
+            for i, (ids_t, mask_t) in enumerate(zip(syn_token_ids_list, syn_token_mask_list)):
+                L = ids_t.shape[1]
+                syn_ids_padded[i, :, :L] = ids_t
+                syn_mask_padded[i, :, :L] = mask_t
+
+            self.register_buffer('synonym_token_ids', syn_ids_padded)   # [num_verbs, 5, max_syn_len]
+            self.register_buffer('synonym_token_mask', syn_mask_padded) # [num_verbs, 5, max_syn_len]
+
         if self.num_classes == 600:
             tokenizer = self.clip_head['tokenizer']
             hoi_labels = [v.replace("a photo of ", "") for k, v in hico_text_label.hico_text_label.items()]
@@ -706,25 +746,28 @@ class HOILLAVA(nn.Module):
 
             if self.num_classes == 117:
                 #import pdb; pdb.set_trace()
-                h_verb_scores = h_vocab[:, self.verb_token_ids] #- global_verb_scores # [N, 117, max_tokens] - global_verb_logits.unsqueeze(0)
+                # Primary verb token scores: [N, 117, max_tokens]
+                h_verb_scores = h_vocab[:, self.verb_token_ids]
                 h_verb_scores = h_verb_scores.masked_fill(~self.verb_token_mask.unsqueeze(0), 0.0)
+                h_verb_avg = h_verb_scores.sum(dim=-1) / self.verb_token_mask.sum(dim=-1).unsqueeze(0)  # [N, 117]
 
-                o_verb_scores = o_vocab[:, self.verb_token_ids] #- global_verb_scores # [N, 117, max_tokens]
+                o_verb_scores = o_vocab[:, self.verb_token_ids]
                 o_verb_scores = o_verb_scores.masked_fill(~self.verb_token_mask.unsqueeze(0), 0.0)
+                o_verb_avg = o_verb_scores.sum(dim=-1) / self.verb_token_mask.sum(dim=-1).unsqueeze(0)  # [N, 117]
 
-                # ho_verb_scores = ho_vocab[:, self.verb_token_ids] #- global_verb_scores # [N, 117, max_tokens]
-                # ho_verb_scores = ho_verb_scores.masked_fill(~self.verb_token_mask.unsqueeze(0), 0.0)
+                # Synonym token scores: [N, 117, 5, max_syn_len]
+                h_syn_scores = h_vocab[:, self.synonym_token_ids]
+                h_syn_scores = h_syn_scores.masked_fill(~self.synonym_token_mask.unsqueeze(0), 0.0)
+                h_syn_avg = h_syn_scores.sum(dim=-1) / self.synonym_token_mask.sum(dim=-1).unsqueeze(0).clamp(min=1)  # [N, 117, 5]
+                h_syn_avg = h_syn_avg.mean(dim=-1)  # [N, 117]
 
-                #decaying weighted sum
-                # max_tokens = self.verb_token_mask.shape[-1]
-                # positions = torch.arange(max_tokens, device=self.verb_token_mask.device, dtype=h_verb_scores.dtype)
-                # decay = torch.exp(-0.5 * positions)  # [max_tokens], e.g. [1.0, 0.61, 0.37, 0.22, ...]
-                # decay = decay * self.verb_token_mask  # [117, max_tokens]
-                # decay_sum = decay.sum(dim=-1).unsqueeze(0)  # [1, 117]
+                o_syn_scores = o_vocab[:, self.synonym_token_ids]
+                o_syn_scores = o_syn_scores.masked_fill(~self.synonym_token_mask.unsqueeze(0), 0.0)
+                o_syn_avg = o_syn_scores.sum(dim=-1) / self.synonym_token_mask.sum(dim=-1).unsqueeze(0).clamp(min=1)  # [N, 117, 5]
+                o_syn_avg = o_syn_avg.mean(dim=-1)  # [N, 117]
 
-
-                logits_o = o_verb_scores.sum(dim=-1) / self.verb_token_mask.sum(dim=-1).unsqueeze(0)
-                logits_h = h_verb_scores.sum(dim=-1) / self.verb_token_mask.sum(dim=-1).unsqueeze(0)
+                logits_h = (h_verb_avg + h_syn_avg) / 2
+                logits_o = (o_verb_avg + o_syn_avg) / 2
             #     #logits_h = (h_verb_scores * decay.unsqueeze(0)).sum(dim=-1) / decay_sum
             #     #logits_o = (o_verb_scores * decay.unsqueeze(0)).sum(dim=-1) / decay_sum
             #     #logits_ho = (ho_verb_scores * decay.unsqueeze(0)).sum(dim=-1) / decay_sum

@@ -298,30 +298,56 @@ def generate_llava_model(
     if text_prompt is None:
         text_prompt = "Write a detailed description."
 
-    conv = generate_text_prompt(model["model"], model_name, text_prompt)
-    input_ids = prompt_to_img_input_ids(conv.get_prompt(), tokenizer)
+    has_image = images_tensor is not None
+
+    if has_image:
+        conv = generate_text_prompt(model["model"], model_name, text_prompt)
+        input_ids = prompt_to_img_input_ids(conv.get_prompt(), tokenizer)
+    else:
+        # Text-only: build conv without image token
+        if "llama-2" in model_name.lower():
+            conv_mode = "llava_llama_2"
+        elif "v1" in model_name.lower():
+            conv_mode = "llava_v1"
+        elif "mpt" in model_name.lower():
+            conv_mode = "mpt"
+        else:
+            conv_mode = "llava_v0"
+        conv = conv_templates[conv_mode].copy()
+        conv.append_message(conv.roles[0], text_prompt)
+        conv.append_message(conv.roles[1], None)
+        input_ids = (
+            tokenizer(conv.get_prompt(), return_tensors="pt").input_ids.cuda()
+        )
 
     with torch.inference_mode():
-        output = model["model"].generate(
+        generate_kwargs = dict(
             inputs=input_ids,
-            images=images_tensor,
-            image_sizes=[image_sizes],
             do_sample=False,
             num_beams=1,
             max_new_tokens=512,
             return_dict_in_generate=True,
             output_hidden_states=True,
-            output_scores = True
+            output_scores=True,
         )
+        if has_image:
+            generate_kwargs["images"] = images_tensor
+            generate_kwargs["image_sizes"] = [image_sizes]
+
+        output = model["model"].generate(**generate_kwargs)
 
     hidden = torch.stack(output.hidden_states[0])  # [layers+1, 1, seq_len, dim]
-    image_token_index = input_ids.tolist()[0].index(-200)
-    img_hidden_states = hidden[:, :, image_token_index : image_token_index + (24 * 24), :]
+
+    if has_image:
+        image_token_index = input_ids.tolist()[0].index(-200)
+        img_hidden_states = hidden[:, :, image_token_index : image_token_index + (24 * 24), :]
+    else:
+        img_hidden_states = None
 
     generated_ids = output.sequences
     generated_text = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
 
-    return img_hidden_states, generated_text,  generated_ids, torch.stack(output.scores, dim=0).squeeze(1)
+    return img_hidden_states, generated_text, generated_ids, torch.stack(output.scores, dim=0).squeeze(1)
 
 
 def retrieve_logit_lens_llava(state, img_path, args, text_prompt = None):

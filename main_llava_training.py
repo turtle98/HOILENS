@@ -23,6 +23,7 @@ import datetime
 from engine import CustomisedDLE
 from datasets import DataFactory, custom_collate
 from utils.hico_text_label import hico_unseen_index
+from utils.hico_list import hico_verb_object_list
 
 warnings.filterwarnings("ignore")
 
@@ -219,7 +220,16 @@ def main(rank, args):
             for line in log_lines:
                 f.write(line + "\n")
 
-            
+        if args.per_class_ap:
+            per_class_log = os.path.join(args.output_dir, "per_class_ap_eval.txt")
+            with open(per_class_log, "w") as f:
+                f.write("Per-class AP — Evaluation\n")
+                f.write(f"{'idx':>4}  {'verb':<20}  {'object':<20}  {'AP':>8}\n")
+                f.write("-" * 58 + "\n")
+                for i, (verb, obj) in enumerate(hico_verb_object_list):
+                    f.write(f"{i:>4}  {verb:<20}  {obj:<20}  {ap[i].item() * 100:>8.2f}\n")
+            print(f"Per-class AP saved to {per_class_log}")
+
         return
     
 

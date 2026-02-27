@@ -16,6 +16,7 @@ from tqdm import tqdm
 from collections import defaultdict
 
 from utils.hico_text_label import hico_unseen_index
+from utils.hico_list import hico_verb_object_list
 import utils.ddp as ddp
 import pocket
 from pocket.core import DistributedLearningEngine
@@ -68,8 +69,18 @@ class CustomisedDLE(DistributedLearningEngine):
             self.epoch_start_time = time.time()
             self.last_logged_epoch = self._state.epoch
         self._state.iteration += 1
+        # relocate_to_cuda silently sets strings to None (returns None for
+        # unsupported types when ignore=True).  Extract string fields first.
+        saved_text_labels = {}
+        if isinstance(self._state.targets, list):
+            for i, t in enumerate(self._state.targets):
+                if isinstance(t, dict) and 'text_label' in t:
+                    saved_text_labels[i] = t.pop('text_label')
         self._state.inputs = relocate_to_cuda(self._state.inputs,ignore=True, non_blocking=True)
         self._state.targets = relocate_to_cuda(self._state.targets,ignore=True, non_blocking=True)
+        # Restore string fields after relocation
+        for i, lbl in saved_text_labels.items():
+            self._state.targets[i]['text_label'] = lbl
 
     def _print_statistics(self):
         running_loss = self._state.running_loss.mean()
@@ -200,6 +211,17 @@ class CustomisedDLE(DistributedLearningEngine):
                 for k, v in mAPs.items():
                     f.write(f"{k}: {v:.2f}\n")
                 f.write("\n")
+
+            if self.args.per_class_ap:
+                per_class_log = os.path.join(self.args.output_dir, f"per_class_ap_epoch{self._state.epoch}.txt")
+                with open(per_class_log, "w") as f:
+                    f.write(f"Per-class AP — Epoch {self._state.epoch}\n")
+                    f.write(f"{'idx':>4}  {'verb':<20}  {'object':<20}  {'AP':>8}\n")
+                    f.write("-" * 58 + "\n")
+                    for i, (verb, obj) in enumerate(hico_verb_object_list):
+                        f.write(f"{i:>4}  {verb:<20}  {obj:<20}  {ap[i].item() * 100:>8.2f}\n")
+                print(f"Per-class AP saved to {per_class_log}")
+
             self.save_checkpoint()
             #wandb.log(mAPs)
 

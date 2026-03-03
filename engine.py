@@ -131,11 +131,56 @@ class CustomisedDLE(DistributedLearningEngine):
                 torch.nn.utils.clip_grad_norm_(self._state.net.parameters(), self.max_norm)
             self._state.optimizer.step()
 
+    def _switch_to_stage2(self):
+        """Freeze interactiveness_head and switch optimizer to LoRA params."""
+        net = self._state.net.module  # unwrap DDP
+        net.set_training_stage(2)
+
+        param_dicts = [
+            {
+                "params": [
+                    p for n, p in net.named_parameters()
+                    if p.requires_grad and 'lora_' in n
+                ],
+                "lr": self.args.lr_lora,
+            },
+            {
+                "params": [
+                    p for n, p in net.named_parameters()
+                    if p.requires_grad and 'lora_' not in n
+                ],
+                "lr": self.args.lr_head,
+            },
+        ]
+        new_optim = torch.optim.AdamW(
+            param_dicts, lr=self.args.lr_head, weight_decay=self.args.weight_decay
+        )
+        lr_drop_s2 = getattr(self.args, 'lr_drop_stage2', self.args.lr_drop)
+        new_scheduler = torch.optim.lr_scheduler.StepLR(new_optim, lr_drop_s2)
+        self.update_state_key(optimizer=new_optim, lr_scheduler=new_scheduler)
+
+        if self._rank == 0:
+            n_trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
+            n_lora = sum(
+                p.numel() for n, p in net.named_parameters()
+                if p.requires_grad and 'lora_' in n
+            )
+            print(
+                f"\n[Stage 2] Switched to LLM training at epoch {self._state.epoch}. "
+                f"Trainable: {n_trainable:,}  (LoRA: {n_lora:,})\n"
+            )
+
     def _on_end_epoch(self):
         # if self._rank == 0:
         #     #self.save_checkpoint()
         if self._state.lr_scheduler is not None:
             self._state.lr_scheduler.step()
+
+        # Two-stage training: switch from head-only to LLM at stage1_epochs
+        stage1_epochs = getattr(self.args, 'stage1_epochs', None)
+        if stage1_epochs is not None and self._state.epoch == stage1_epochs:
+            self._switch_to_stage2()
+
         self.net.object_class_to_target_class = self.test_loader.dataset.dataset.object_class_to_target_class
         if self.epoch_start_time is not None:
             epoch_duration = time.time() - self.epoch_start_time
@@ -159,6 +204,13 @@ class CustomisedDLE(DistributedLearningEngine):
             return
             # raise NotImplementedError(f"Evaluation on V-COCO has not been implemented.")
         
+        # Skip eval during Stage 1 — HOI scores are not meaningful yet
+        stage1_epochs = getattr(self.args, 'stage1_epochs', 0)
+        if self._state.epoch <= stage1_epochs and self._state.epoch % 5 == 0:
+            self.save_checkpoint()
+        if stage1_epochs > 0 and self._state.epoch <= stage1_epochs:
+            return
+
         start_test_time = time.time()
         ap = self.test_hico(self.test_loader, self.args)
         test_duration = time.time() - start_test_time
@@ -222,6 +274,7 @@ class CustomisedDLE(DistributedLearningEngine):
                         f.write(f"{i:>4}  {verb:<20}  {obj:<20}  {ap[i].item() * 100:>8.2f}\n")
                 print(f"Per-class AP saved to {per_class_log}")
 
+        if self._state.epoch % 5 == 0 or self._state.epoch == 1:
             self.save_checkpoint()
             #wandb.log(mAPs)
 

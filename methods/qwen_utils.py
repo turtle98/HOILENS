@@ -68,7 +68,7 @@ except ImportError:
 QWEN_MODEL_ID         = "Qwen/Qwen2.5-VL-3B-Instruct"
 QWEN_HIDDEN_SIZE      = 2048        # LLM hidden dim      (LLaVA 7B: 4096)
 QWEN_NUM_LAYERS       = 28          # transformer layers  (LLaVA 7B: 32)
-QWEN_IMAGE_SIZE       = 448         # fixed input resolution
+QWEN_IMAGE_SIZE       = 448   # fixed input resolution
 QWEN_PATCH_SIZE       = 14         # ViT patch size in pixels
 QWEN_MERGE_SIZE       = 2           # spatial merge factor (2×2 → 4 patches / token)
 QWEN_GRID_H           = QWEN_IMAGE_SIZE // (QWEN_PATCH_SIZE * QWEN_MERGE_SIZE)  # 16
@@ -508,20 +508,12 @@ def load_qwen_state(rank):
     """
     device_str = f"cuda:{rank}"
 
-    try:
-        qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            QWEN_MODEL_ID,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="sdpa",
-            device_map=device_str,
-        )
-    except Exception:
-        # Fallback if flash-attn is unavailable
-        qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            QWEN_MODEL_ID,
-            torch_dtype=torch.bfloat16,
-            device_map=device_str,
-        )
+    qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        QWEN_MODEL_ID,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="sdpa",
+        device_map=device_str,
+    )
     qwen_model = qwen_model.to(torch.bfloat16)
 
     # Allow native resolution — actual size is driven by resized_height/resized_width

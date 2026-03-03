@@ -39,7 +39,11 @@ class HOISFTDataset(DataFactory):
         All other args are forwarded to DataFactory.__init__.
     """
 
-    def __init__(self, *args, caption_file: str | None = None, **kwargs):
+    _DEFAULT_CAPTION_FILE = os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "..", "hicodet", "captions.json"
+    ))
+
+    def __init__(self, *args, caption_file: str | None = _DEFAULT_CAPTION_FILE, **kwargs):
         super().__init__(*args, **kwargs)
 
         self._captions: dict[str, str] = {}

@@ -32,7 +32,7 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
 
-from models.ours_qwen_hoi_sft import build_hoi_sft_detector
+from models.ours_qwen_hoi_sft_inter import build_hoi_sft_detector
 from utils.args import get_args
 from engine import CustomisedDLE
 from datasets.hoi_sft_dataset import HOISFTDataset, hoi_sft_collate
@@ -65,6 +65,28 @@ def add_sft_args(parser):
     parser.add_argument(
         '--lora-rank', default=8, type=int,
         help='LoRA rank for q/k/v/o projections of the language model'
+    )
+    parser.add_argument(
+        '--no-gen-loss', dest='use_gen_loss', action='store_false',
+        help='Disable the generation (SFT cross-entropy) loss term'
+    )
+    parser.set_defaults(use_gen_loss=True)
+    parser.add_argument(
+        '--stage1-epochs', default=30, type=int,
+        help=(
+            'Number of epochs to train only the interactiveness head '
+            '(Stage 1). After this many epochs the head is frozen and the '
+            'LoRA adapters are unfrozen for Stage 2. Set to 0 to skip Stage 1.'
+        )
+    )
+    parser.add_argument(
+        '--lr-drop-stage2', default=None, type=int,
+        help=(
+            'StepLR step size for Stage 2 (LLM training). '
+            'Stage 2 gets a fresh scheduler starting from epoch 0, so this '
+            'controls how many Stage-2 epochs before the first LR drop. '
+            'Defaults to --lr-drop if not set.'
+        )
     )
     parser.add_argument(
         '--caption-file', default=None, type=str,
@@ -116,7 +138,6 @@ def main(rank, args):
         zs_type=args.zs_type,
         num_classes=args.num_classes,
         args=args,
-        caption_file=getattr(args, "caption_file", None),
     )
     if args.few_shot:
         testset = HOISFTDataset(
@@ -177,6 +198,7 @@ def main(rank, args):
         clip_model_path=args.clip_dir_vit,
         rank=rank,
         sft_loss_weight=getattr(args, 'sft_loss_weight', 0.5),
+        use_gen_loss=getattr(args, 'use_gen_loss', True),
         lora_rank=getattr(args, 'lora_rank', 8),
     )
 
@@ -296,37 +318,50 @@ def main(rank, args):
     for p in model.detector.parameters():
         p.requires_grad = False
 
-    # Freeze the Qwen backbone base weights (only LoRA adapters are trainable)
-    # This is already handled in HOIQWEN_SFT.__init__ via:
-    #   for name, p in self.peft_qwen.named_parameters():
-    #       p.requires_grad = ("lora_" in name)
-    # No additional freezing needed here.
+    stage1_epochs = getattr(args, 'stage1_epochs', 30)
 
-    param_dicts = [
-        {
-            # LoRA adapters
-            "params": [
-                p for n, p in model.named_parameters()
-                if p.requires_grad and 'lora_' in n
-            ],
-            "lr": args.lr_lora,
-        },
-        {
-            # spatial_head and any other trainable params
-            "params": [
-                p for n, p in model.named_parameters()
-                if p.requires_grad and 'lora_' not in n
-            ],
-            "lr": args.lr_head,
-        },
-    ]
-
-    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    n_lora      = sum(
-        p.numel() for n, p in model.named_parameters()
-        if p.requires_grad and 'lora_' in n
-    )
-    print(f"[INFO] trainable params total: {n_trainable:,}  (LoRA: {n_lora:,})")
+    if stage1_epochs > 0:
+        # ----------------------------------------------------------------
+        # Stage 1: train interactiveness_head + spatial_head + ho_fusion_mlp
+        # LoRA adapters are frozen; LLM forward is skipped.
+        # ----------------------------------------------------------------
+        model.set_training_stage(1)
+        param_dicts = [
+            {
+                "params": [
+                    p for n, p in model.named_parameters()
+                    if p.requires_grad
+                ],
+                "lr": args.lr_head,
+            },
+        ]
+        n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"[INFO] Stage 1 — trainable params: {n_trainable:,} (LoRA frozen)")
+    else:
+        # Skip Stage 1, go straight to Stage 2
+        model.set_training_stage(2)
+        param_dicts = [
+            {
+                "params": [
+                    p for n, p in model.named_parameters()
+                    if p.requires_grad and 'lora_' in n
+                ],
+                "lr": args.lr_lora,
+            },
+            {
+                "params": [
+                    p for n, p in model.named_parameters()
+                    if p.requires_grad and 'lora_' not in n
+                ],
+                "lr": args.lr_head,
+            },
+        ]
+        n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        n_lora      = sum(
+            p.numel() for n, p in model.named_parameters()
+            if p.requires_grad and 'lora_' in n
+        )
+        print(f"[INFO] Stage 2 (no Stage 1) — trainable: {n_trainable:,}  (LoRA: {n_lora:,})")
 
     optim        = torch.optim.AdamW(param_dicts, lr=args.lr_head, weight_decay=args.weight_decay)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optim, args.lr_drop)
@@ -381,6 +416,9 @@ if __name__ == '__main__':
     # Merge SFT args into the base namespace
     args.sft_loss_weight = sft_args.sft_loss_weight
     args.lora_rank       = sft_args.lora_rank
+    args.use_gen_loss    = sft_args.use_gen_loss
+    args.stage1_epochs   = sft_args.stage1_epochs
+    args.lr_drop_stage2  = sft_args.lr_drop_stage2 if sft_args.lr_drop_stage2 is not None else args.lr_drop
 
     print(args)
 

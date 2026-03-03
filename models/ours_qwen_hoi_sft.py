@@ -17,7 +17,7 @@ Answer part (teacher-forced during training):
 
 Key design decisions
 --------------------
-1. PEFT LoRA on q_proj/k_proj/v_proj/o_proj of the language model (r=8).
+1. PEFT LoRA on q_proj/k_proj/v_proj/o_proj of the language model (r=8, alpha=2r).
 2. <hoi_feat> positions in inputs_embeds are replaced with ROI-aligned H-O
    features computed by a trainable spatial_head (same as ours_qwen_new_old).
 3. 4D causal attention mask with an additional block:
@@ -91,7 +91,7 @@ from methods.hoi_prompt_utils import (
 
 def compute_object_embeddings_qwen(model_state, obj_class_names, device="cpu"):
     tokenizer = model_state["tokenizer"]
-    lm_head   = model_state["model"].lm_head.weight.detach().float()
+    lm_head   = model_state["model"].lm_head.weight.detach()
     embs = []
     for name in obj_class_names:
         ids = tokenizer.encode(name, add_special_tokens=False)
@@ -132,8 +132,10 @@ class HOIQWEN_SFT(nn.Module):
         max_instances:     int   = 15,
         object_class_to_target_class: List[list] = None,
         object_n_verb_to_interaction: List[list] = None,
-        sft_loss_weight: float = 1.0,
-        lora_rank:       int   = 8,
+        sft_loss_weight:  float = 1.0,
+        attn_loss_weight: float = 1.0,
+        use_gen_loss:     bool  = True,
+        lora_rank:        int   = 8,
     ) -> None:
         super().__init__()
 
@@ -160,6 +162,8 @@ class HOIQWEN_SFT(nn.Module):
         self.dataset                     = args.dataset
         self.reserve_indices             = reserve_indices
         self.sft_loss_weight             = sft_loss_weight
+        self.attn_loss_weight            = attn_loss_weight
+        self.use_gen_loss                = use_gen_loss
 
         # ------------------------------------------------------------------
         # Qwen model + processor + tokenizer
@@ -175,8 +179,8 @@ class HOIQWEN_SFT(nn.Module):
         # (lm_head is NOT in LoRA targets so it stays frozen throughout)
         self.register_buffer(
             "lm_head_weight",
-            qwen_model.lm_head.weight.detach().cpu().float(),
-        )  # [vocab_size, QWEN_HIDDEN_SIZE]
+            qwen_model.lm_head.weight.detach().cpu().to(torch.bfloat16).contiguous(),
+        )  # [QWEN_HIDDEN_SIZE, vocab_size]  — pre-transposed for matmul
 
         # ------------------------------------------------------------------
         # Register <hoi_feat> special token
@@ -196,10 +200,10 @@ class HOIQWEN_SFT(nn.Module):
         # ------------------------------------------------------------------
         peft_config = LoraConfig(
             r=lora_rank,
-            lora_alpha=lora_rank,
+            lora_alpha=2 * lora_rank,
             target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
             bias="none",
-            lora_dropout=0.0,
+            lora_dropout=0,
         )
         # get_peft_model modifies qwen_model in-place (replaces linears)
         # and wraps it in a PeftModel container.
@@ -215,15 +219,23 @@ class HOIQWEN_SFT(nn.Module):
         # ------------------------------------------------------------------
         self.spatial_head = nn.Sequential(
             nn.Linear(36, 128),  nn.ReLU(),
-            nn.Linear(128, 256), nn.ReLU(),
-            nn.Linear(256, QWEN_HIDDEN_SIZE), nn.ReLU(),
-        ).to(torch.bfloat16)
+            nn.Linear(128, 512), nn.ReLU(),
+            nn.Linear(512, QWEN_HIDDEN_SIZE), nn.ReLU(),
+        )
 
         self.ho_fusion_mlp = nn.Sequential(
-            nn.Linear(2 * QWEN_HIDDEN_SIZE, 256), nn.ReLU(),
-            nn.Linear(256, QWEN_HIDDEN_SIZE)
-        ).to(torch.bfloat16)
-        self.fusion_scale = nn.Parameter(torch.tensor(0.1, dtype=torch.bfloat16))
+            nn.Linear(2 * QWEN_HIDDEN_SIZE, 512), nn.ReLU(),
+            nn.Linear(512, QWEN_HIDDEN_SIZE)
+        )
+
+        self.fusion_scale = nn.Parameter(torch.tensor(0.0))  # exp(0) = 1.0 initial scale
+
+        # Usage
+       # fusion_scale = 
+        #self.fusion_scale = nn.Parameter(torch.tensor(0.1))
+
+        # Interactiveness classifier (separate from lm_head)
+
         # ------------------------------------------------------------------
         # Verb / HOI token buffers for BCE scoring — copied from HOIQWEN
         # ------------------------------------------------------------------
@@ -355,29 +367,6 @@ class HOIQWEN_SFT(nn.Module):
             #     for base, pres, past in verb_forms_3
             # ]
 
-            all_form_ids = []
-            for forms in verb_forms_3:
-                form_ids = []
-                for form in forms:
-                    ids = tokenizer.encode(form, add_special_tokens=False)
-                    ids = list(dict.fromkeys(ids))
-                    form_ids.append(ids)
-                all_form_ids.append(form_ids)
-
-            num_verbs  = len(verb_forms_3)
-            num_forms  = len(verb_forms_3[0])
-            max_tokens = max(
-                len(ids) for form_ids in all_form_ids for ids in form_ids
-            )
-            padded = torch.zeros(num_verbs, num_forms, max_tokens, dtype=torch.long)
-            mask   = torch.zeros(num_verbs, num_forms, max_tokens, dtype=torch.bool)
-            for i, form_ids in enumerate(all_form_ids):
-                for j, ids in enumerate(form_ids):
-                    padded[i, j, :len(ids)] = torch.tensor(ids)
-                    mask[i, j, :len(ids)]   = True
-            self.register_buffer('verb_token_ids',  padded)
-            self.register_buffer('verb_token_mask', mask)
-
             verb_forms_3 = [
                 (base, pres, past, ' ' + base, ' ' + pres, ' ' + past)
                 for base, pres, past in verb_forms_3
@@ -452,7 +441,7 @@ class HOIQWEN_SFT(nn.Module):
                 i for i in range(self.num_classes)
                 if i not in self.filtered_hoi_idx
             ]
-
+        #self.verb_bias = nn.Parameter(torch.tensor(15.0))
     # -----------------------------------------------------------------------
     # Qwen inputs builder (SFT version — returns input_ids for position finding)
     # -----------------------------------------------------------------------
@@ -555,6 +544,20 @@ class HOIQWEN_SFT(nn.Module):
         prior_o[pair_idx, flat_target] = s_o[pair_idx]
         return torch.stack([prior_h, prior_o])
 
+    def get_interactiveness_labels(self, boxes_h, boxes_o, targets):
+        """Binary label: 1 if pair matches any GT pair by IoU, else 0."""
+        gt_bx_h = self.recover_boxes(
+            targets['boxes_h'], targets['size']
+        ).to(boxes_h.device)
+        gt_bx_o = self.recover_boxes(
+            targets['boxes_o'], targets['size']
+        ).to(boxes_h.device)
+        if len(gt_bx_h) == 0:
+            return torch.zeros(len(boxes_h), dtype=torch.float, device=boxes_h.device)
+        # [n_pairs, n_gt] — take element-wise min of h-iou and o-iou
+        iou_mat = torch.min(box_iou(boxes_h, gt_bx_h), box_iou(boxes_o, gt_bx_o))
+        return (iou_mat.max(dim=1).values >= self.fg_iou_thresh).float()  # [n_pairs]
+
     # -----------------------------------------------------------------------
     # compute_sim_scores — main per-image logic
     # -----------------------------------------------------------------------
@@ -580,6 +583,8 @@ class HOIQWEN_SFT(nn.Module):
         object_class_collated = []
         all_logits_collated   = []
         gen_losses            = []
+        attn_losses           = []
+        attn_n_pairs_list     = []
 
         for b_idx, props in enumerate(region_props):
             boxes  = props['boxes']
@@ -687,10 +692,9 @@ class HOIQWEN_SFT(nn.Module):
             #     pairwise_spatial_reshaped = pairwise_spatial          # [n_pairs, hidden]
             # else:
             pairwise_spatial = compute_spatial_encodings(
-                [boxes[x.flatten()], ], [boxes[y.flatten()], ], [(img_H, img_W), ]
+                [boxes[x_keep], ], [boxes[y_keep], ], [(img_H, img_W), ]
             ).to(torch.bfloat16)
-            pairwise_spatial          = self.spatial_head(pairwise_spatial)
-            pairwise_spatial_reshaped = pairwise_spatial.reshape(n, n, -1)[x_keep, y_keep]
+            pairwise_spatial_reshaped = self.spatial_head(pairwise_spatial.float()).to(torch.bfloat16)  # [n_pairs, 2048]
 
             # ------------------------------------------------------------------
             # Build PIL image and question embeddings (no_grad frozen pass)
@@ -717,17 +721,17 @@ class HOIQWEN_SFT(nn.Module):
             # ------------------------------------------------------------------
             img_feat = q_embeds[:, img_start:img_end, :]  # [1, num_img_tok, 2048]
             llava_feat_for_roi = (
-                img_feat.float()
+                img_feat
                 .view(1, grid_h, grid_w, QWEN_HIDDEN_SIZE)
                 .permute(0, 3, 1, 2)
-            )  # [1, 2048, grid_h, grid_w]
+            )  # [1, 2048, grid_h, grid_w]  bf16
 
             _scale = 1.0 / _stride   # 1/28
 
             def _roi_boxes(idx_tensor):
                 bx   = boxes[idx_tensor]
                 bidx = torch.zeros(bx.size(0), dtype=torch.long, device=bx.device)
-                return torch.cat([bidx[:, None].float(), bx], dim=1)
+                return torch.cat([bidx[:, None], bx], dim=1)
 
             roi_ho = torch.cat([
                 torch.zeros(union_boxes.size(0), 1, dtype=union_boxes.dtype,
@@ -737,31 +741,44 @@ class HOIQWEN_SFT(nn.Module):
             roi_boxes  = _roi_boxes(h_unique_indices)
             roi_boxes1 = _roi_boxes(o_unique_indices)
 
+            _roi_input = llava_feat_for_roi.float()  # roi_align requires fp32
             h_feats0  = torchvision.ops.roi_align(
-                llava_feat_for_roi, roi_boxes,
+                _roi_input, roi_boxes,
                 output_size=(7, 7), spatial_scale=_scale, aligned=True
             )
             o_feats0  = torchvision.ops.roi_align(
-                llava_feat_for_roi, roi_boxes1,
+                _roi_input, roi_boxes1,
                 output_size=(7, 7), spatial_scale=_scale, aligned=True
             )
 
             ho_feats0 = torchvision.ops.roi_align(
-                llava_feat_for_roi, roi_ho,
+                _roi_input, roi_ho,
                 output_size=(7, 7), spatial_scale=_scale, aligned=True
             )
+            del _roi_input
             ho_feats0 = ho_feats0.flatten(2).mean(-1).unsqueeze(0).to(img_feat.dtype)
             h_feats0  = h_feats0.flatten(2).mean(-1).unsqueeze(0).to(img_feat.dtype)
             o_feats0  = o_feats0.flatten(2).mean(-1).unsqueeze(0).to(img_feat.dtype)
             # [1, n_pairs, 2048]
-            ho_feats0 = ho_feats0 + self.fusion_scale * self.ho_fusion_mlp(torch.cat([h_feats0[0][h_inverse_indices], o_feats0[0][o_inverse_indices]], dim=-1))
+
+            fusion_output = self.ho_fusion_mlp(
+                torch.cat([h_feats0[0][h_inverse_indices], o_feats0[0][o_inverse_indices]], dim=-1).float()
+            )
+            ho_feats0 = ho_feats0 + (torch.exp(self.fusion_scale) * fusion_output).to(ho_feats0.dtype)
+            # ho_feats0 = ho_feats0 + self.fusion_scale.to(ho_feats0.dtype) * self.ho_fusion_mlp(
+            #     torch.cat([h_feats0[0][h_inverse_indices], o_feats0[0][o_inverse_indices]], dim=-1).float()
+            # ).to(ho_feats0.dtype)
+           # ho_feats0 = ho_feats0 + self.fusion_scale.to(ho_feats0.dtype) * self.ho_fusion_mlp(torch.cat([h_feats0[0][h_inverse_indices], o_feats0[0][o_inverse_indices]], dim=-1))
 
             # ------------------------------------------------------------------
             # Build ho_queries: ROI + spatial + object embeddings
             # ------------------------------------------------------------------
+            # spatial_fused = self.ho_spatial_fusion_mlp(
+            #     torch.cat([ho_feats0, pairwise_spatial_reshaped.unsqueeze(0)], dim=-1)
+            # )  # [1, n_pairs, 2048]
             ho_queries = (
-                ho_feats0
-                + pairwise_spatial_reshaped.unsqueeze(0)
+                ho_feats0 +
+                pairwise_spatial_reshaped.unsqueeze(0)
                 + self.object_embedding[labels[x_keep]].to(torch.bfloat16).unsqueeze(0)
                 + self.object_embedding[labels[y_keep]].to(torch.bfloat16).unsqueeze(0)
             )  # [1, n_pairs, 2048]
@@ -781,6 +798,14 @@ class HOIQWEN_SFT(nn.Module):
             hoi_start = hoi_positions[0].item()
             hoi_end   = hoi_positions[-1].item() + 1   # exclusive
 
+            # Permute pair order each iteration (training only)
+            if self.training:
+                pair_perm   = torch.randperm(n_pairs, device=device)
+                ho_queries  = ho_queries[:, pair_perm, :]   # [1, n_pairs, 2048]
+                x_keep      = x_keep[pair_perm]             # [n_pairs]
+                y_keep      = y_keep[pair_perm]             # [n_pairs]
+                union_boxes = union_boxes[pair_perm]         # [n_pairs, 4]
+
             # Detach prefix and suffix (they come from frozen no_grad forward)
             q_prefix = q_embeds[:, :hoi_start, :].detach()
             q_suffix = q_embeds[:, hoi_end:, :].detach()
@@ -789,58 +814,61 @@ class HOIQWEN_SFT(nn.Module):
             # [1, q_len, 2048] — hoi_feat positions now hold ho_queries
 
             # ------------------------------------------------------------------
-            # Tokenise answer and build combined sequence
+            # Tokenise answer and build combined sequence (only when gen_loss is on)
             # ------------------------------------------------------------------
-            if self.training and text_labels is not None and text_labels[b_idx] is not None:
-                ans_text = text_labels[b_idx]
+            if self.use_gen_loss:
+                if self.training and text_labels is not None and text_labels[b_idx] is not None:
+                    ans_text = text_labels[b_idx]
+                else:
+                    ans_text = "none"   # dummy during inference / no-label
+
+                eos_tok  = self.tokenizer.eos_token or "<|im_end|>"
+                full_ans = ans_text + eos_tok
+                ans_ids  = self.tokenizer.encode(
+                    full_ans, add_special_tokens=False, return_tensors="pt"
+                ).to(device)           # [1, a_len]
+                a_len = ans_ids.shape[1]
+
+                ans_embeds = self.vlm.get_input_embeddings()(ans_ids).to(
+                    combined_q.dtype
+                )  # [1, a_len, 2048]
+                combined  = torch.cat([combined_q, ans_embeds], dim=1)
+                total_len = q_len + a_len
+
+                # 4D attention mask: causal + block answer → image
+                mask4d = torch.zeros(
+                    1, 1, total_len, total_len, dtype=combined.dtype, device=device
+                )
+                mask4d += torch.triu(
+                    torch.full_like(mask4d, float("-inf")), diagonal=1
+                )
+                mask4d[:, :, q_len:, img_start:img_end] = float("-inf")
+
+                # Extend position_ids for answer tokens
+                last_pos    = q_pos_ids[:, 0, -1]                        # [3]
+                ans_offsets = torch.arange(1, a_len + 1, device=device)  # [a_len]
+                ans_pos     = (last_pos[:, None] + ans_offsets[None, :]).unsqueeze(1)
+                pos_ids_full = torch.cat(
+                    [q_pos_ids.to(device), ans_pos.to(device)], dim=-1
+                )  # [3, 1, total_len]
             else:
-                ans_text = "none"   # dummy during inference / no-label
-
-            eos_tok  = self.tokenizer.eos_token or "<|im_end|>"
-            full_ans = ans_text + eos_tok
-            ans_ids  = self.tokenizer.encode(
-                full_ans, add_special_tokens=False, return_tensors="pt"
-            ).to(device)           # [1, a_len]
-            a_len = ans_ids.shape[1]
-
-            ans_embeds = self.vlm.get_input_embeddings()(ans_ids).to(
-                combined_q.dtype
-            )  # [1, a_len, 2048]  (no grad needed for BCE; grad flows via LM)
-
-            combined = torch.cat([combined_q, ans_embeds], dim=1)
-            # [1, q_len + a_len, 2048]
-            total_len = q_len + a_len
-
-            # ------------------------------------------------------------------
-            # 4D attention mask:
-            #   - causal (upper-triangular = -inf)
-            #   - block: answer tokens cannot attend to image tokens
-            # ------------------------------------------------------------------
-            mask4d = torch.zeros(
-                1, 1, total_len, total_len, dtype=combined.dtype, device=device
-            )
-            # Standard causal mask (upper triangular = -inf)
-            mask4d += torch.triu(
-                torch.full_like(mask4d, float("-inf")), diagonal=1
-            )
-            # Block answer → image
-            mask4d[:, :, q_len:, img_start:img_end] = float("-inf")
-
-            # ------------------------------------------------------------------
-            # Extend position_ids for answer tokens
-            # ------------------------------------------------------------------
-            # q_pos_ids: [3, 1, q_len]
-            # For answer tokens, all 3 mrope dims just continue from last q pos
-            last_pos   = q_pos_ids[:, 0, -1]                       # [3]
-            ans_offsets = torch.arange(1, a_len + 1, device=device) # [a_len]
-            ans_pos = (last_pos[:, None] + ans_offsets[None, :]).unsqueeze(1)
-            # [3, 1, a_len]
-            pos_ids_full = torch.cat(
-                [q_pos_ids.to(device), ans_pos.to(device)], dim=-1
-            )  # [3, 1, total_len]
+                ans_text     = "none"
+                ans_ids      = None
+                a_len        = 0
+                combined     = combined_q
+                total_len    = q_len
+                mask4d       = torch.triu(
+                    torch.full(
+                        (1, 1, q_len, q_len), float("-inf"),
+                        dtype=combined_q.dtype, device=device,
+                    ),
+                    diagonal=1,
+                )
+                pos_ids_full = q_pos_ids.to(device)
 
             # ------------------------------------------------------------------
             # Forward through language model (LoRA active)
+            # eager attn_implementation returns output.attentions natively.
             # ------------------------------------------------------------------
             output = self.vlm.language_model(
                 input_ids=None,
@@ -848,48 +876,65 @@ class HOIQWEN_SFT(nn.Module):
                 attention_mask=mask4d,
                 inputs_embeds=combined,
                 use_cache=False,
+                output_attentions=self.training,
                 output_hidden_states=False,
                 return_dict=True,
             )
             hidden = output.last_hidden_state   # [1, total_len, 2048]
-            #if not self.training:
-            # with torch.no_grad():
-            #     generated_ids = self.peft_qwen.generate(
-            #         inputs_embeds=combined_q,        # [1, q_len, 2048]  — question only
-            #         attention_mask=torch.ones(
-            #             1, q_len, device=device, dtype=torch.long
-            #         ),
-            #         max_new_tokens=128,
-            #         do_sample=True,      # Enable multinomial sampling
-            #         temperature=0.7,     # High (>1.0) is more random, Low (<1.0) is more confident
-            #         top_p=0.9,           # Nucleus sampling: keep top 90% cumulative prob tokens
-            #         top_k=50,            # Keep top 50 highest probability tokens
-                    
-            #         eos_token_id=self.tokenizer.eos_token_id,
-            #         pad_token_id=self.tokenizer.eos_token_id,
-            #     )
+            del combined
+            if not self.training:
+                with torch.no_grad():
+                    generated_ids = self.peft_qwen.generate(
+                        inputs_embeds=combined_q,        # [1, q_len, 2048]  — question only
+                        attention_mask=torch.ones(
+                            1, q_len, device=device, dtype=torch.long
+                        ),
+                        max_new_tokens=128,
+                        do_sample=True,      # Enable multinomial sampling
+                        temperature=0.7,     # High (>1.0) is more random, Low (<1.0) is more confident
+                        top_p=0.9,           # Nucleus sampling: keep top 90% cumulative prob tokens
+                        top_k=50,            # Keep top 50 highest probability tokens
+                        
+                        eos_token_id=self.tokenizer.eos_token_id,
+                        pad_token_id=self.tokenizer.eos_token_id,
+                    )
 
-            # # generated_ids[0] contains only the new tokens if using return_dict_in_generate,
-            # # otherwise the full sequence; decode only the generated part:
-            # gen_text = self.tokenizer.decode(
-            #     generated_ids[0], skip_special_tokens=True
-            # )
+            # generated_ids[0] contains only the new tokens if using return_dict_in_generate,
+            # otherwise the full sequence; decode only the generated part:
+            gen_text = self.tokenizer.decode(
+                generated_ids[0], skip_special_tokens=True
+            )
 
             # ------------------------------------------------------------------
             # BCE scoring  (same path as HOIQWEN.compute_sim_scores)
             # ------------------------------------------------------------------
-            lm_head_t = (
-                self.lm_head_weight.T.to(device).to(hidden.dtype)
-            )  # [2048, vocab_size]
 
             hidden_hoi = hidden[:, hoi_start:hoi_end, :]   # [1, n_pairs, 2048]
+
+            if self.use_gen_loss and self.training and a_len > 0 and ans_text != "none":
+                gen_hidden = hidden[:, q_len - 1:q_len + a_len - 1, :]
+                # [1, a_len, 2048]
+                gen_logits = (gen_hidden @ self.lm_head_weight.T).float()
+                # [1, a_len, vocab_size]
+                gen_loss = F.cross_entropy(
+                    gen_logits[0],   # [a_len, vocab_size]
+                    ans_ids[0],      # [a_len]
+                    ignore_index=-100,
+                )
+                del gen_logits, gen_hidden
+                gen_losses.append(gen_loss)
+
+            # Interactiveness score: σ(Linear(f_inter))
+            # inter_logits = self.interactiveness_head(
+            #     hidden_hoi.squeeze(0).float()
+            # ).squeeze(-1).to(torch.bfloat16)  # [n_pairs]
+
             # normed by the LM's final norm (already applied inside language_model)
-            ho_vocab   = hidden_hoi.squeeze(0) @ lm_head_t  # [n_pairs, vocab_size]
+            ho_vocab   = hidden_hoi.squeeze(0) @ self.lm_head_weight.T  # [n_pairs, vocab_size]
 
             all_probs_ho           = F.softmax(ho_vocab, dim=-1)
-            ho_vocab_weighted_mean = (all_probs_ho * ho_vocab).sum(-1)#.detach()
+            ho_vocab_weighted_mean = (all_probs_ho * ho_vocab).sum(-1)
 
-           # import pdb;pdb.set_trace()
 
             if self.num_classes == 117:
                 form_counts = (
@@ -901,39 +946,83 @@ class HOIQWEN_SFT(nn.Module):
                     ~self.verb_token_mask_test.unsqueeze(0), 0.0
                 )
                 ho_verb_avg = (scores_m.sum(dim=-1) / form_counts).max(dim=-1).values
-                # [n_pairs, 117]
-                logits = ho_verb_avg - ho_vocab_weighted_mean.unsqueeze(-1)
-                
 
-            elif self.num_classes == 600:
+                verb_probs = all_probs_ho[:, self.verb_token_ids_test]  # [n_pairs, 117, nf, max_tok]
+                verb_probs = verb_probs.masked_fill(~self.verb_token_mask_test.unsqueeze(0), 0.0)
+                verb_probs = verb_probs.sum(dim=(-1, -2))  # [n_pairs, 117]
+
+                verb_contrib = (all_probs_ho * ho_vocab)[:, self.verb_token_ids_test]
+                verb_contrib = verb_contrib.masked_fill(~self.verb_token_mask_test.unsqueeze(0), 0.0)
+                verb_contrib = verb_contrib.sum(dim=(-1, -2))  # [n_pairs, 117]
+
+                # Leave-one-out baseline for each verb k
+                # total weighted sum: [n_pairs, 1] for broadcasting against [n_pairs, 117]
+                # total_prob = 1.0 since softmax sums to 1 by definition
+                loo_baseline = (ho_vocab_weighted_mean.unsqueeze(-1) - verb_contrib) / (1.0 - verb_probs).clamp(min=1e-8)
+                # [n_pairs, 117]
+
+                logits = (ho_verb_avg - loo_baseline).float()
+                del ho_vocab, all_probs_ho
+
+            if self.num_classes == 600:
                 hoi_counts = self.hoi_token_mask.sum(dim=-1).unsqueeze(0).clamp(min=1)
                 scores_hoi = ho_vocab[:, self.hoi_token_ids]
                 scores_hoi = scores_hoi.masked_fill(
                     ~self.hoi_token_mask.unsqueeze(0), 0.0
                 )
                 ho_hoi_avg = scores_hoi.sum(dim=-1) / hoi_counts
-                logits = ho_hoi_avg - ho_vocab_weighted_mean.unsqueeze(-1)
-                
+                logits = (ho_hoi_avg - ho_vocab_weighted_mean.unsqueeze(-1)).float()
+                del ho_vocab, all_probs_ho
+
 
             # ------------------------------------------------------------------
             # Generation loss (SFT cross-entropy)
             # ------------------------------------------------------------------
-            # if self.training and a_len > 0 and ans_text != "none":
-            #     gen_hidden = hidden[:, q_len - 1:q_len + a_len - 1, :]
-            #     # [1, a_len, 2048]
-            #     gen_logits = gen_hidden.float() @ lm_head_t.float()
-            #     # [1, a_len, vocab_size]
-            #     gen_loss = F.cross_entropy(
-            #         gen_logits[0],   # [a_len, vocab_size]
-            #         ans_ids[0],      # [a_len]
-            #         ignore_index=-100,
-            #     )
-            #     gen_losses.append(gen_loss)
-            # print(self.tokenizer.decode(torch.topk(ho_vocab[3], 100, dim=-1)[1]))
+
+            # print(self.tokenizer.decode(torch.topk(ho_vocab[2], 200, dim=-1)[1]))
             # import pdb; pdb.set_trace()
 
-            # self.tokenizer.decode(gen_logits[0].argmax(-1))
-            # self.tokenizer.decode(ans_ids[0])
+            if self.training and output.attentions:
+                # output.attentions: tuple of n_layers × [1, n_heads, total_len, total_len]
+                # Mean over all layers and heads → [total_len, total_len]
+                attn_last = torch.stack([a[0] for a in output.attentions]).mean(dim=0).mean(dim=0).float()
+                del output
+
+                # HO token rows × image token columns: [n_pairs, n_img_toks]
+                attn_hoi_img = attn_last[hoi_start:hoi_end, img_start:img_end]
+                del attn_last
+
+                # True union mask: human box OR object box.
+                # These are plain bool/float tensors — not in autograd.
+                gy, gx = torch.meshgrid(
+                    torch.arange(grid_h, dtype=torch.float32, device=device),
+                    torch.arange(grid_w, dtype=torch.float32, device=device),
+                    indexing='ij',
+                )
+                cx = (gx + 0.5) * _stride
+                cy = (gy + 0.5) * _stride
+                del gy, gx
+
+                def _box_mask(bx):
+                    return (
+                        (cx >= bx[:, 0].view(n_pairs, 1, 1)) &
+                        (cx <= bx[:, 2].view(n_pairs, 1, 1)) &
+                        (cy >= bx[:, 1].view(n_pairs, 1, 1)) &
+                        (cy <= bx[:, 3].view(n_pairs, 1, 1))
+                    )
+
+                box_mask = (_box_mask(x_boxes) | _box_mask(y_boxes)).float().view(n_pairs, -1)
+                del cx, cy
+
+                # Spatial focusing loss (eq. 12 negated):
+                #   L_i = 1 - Σ(A_i · M_ho) / Σ(A_i)
+                numerator        = (attn_hoi_img * box_mask).sum(dim=-1)
+                denominator      = attn_hoi_img.sum(dim=-1).clamp(min=1e-8)
+                spatial_loss_sum = (1.0 - numerator / denominator).sum()
+                del box_mask, attn_hoi_img
+                attn_losses.append(spatial_loss_sum)
+                attn_n_pairs_list.append(n_pairs)
+
             # ------------------------------------------------------------------
             # Collect outputs
             # ------------------------------------------------------------------
@@ -944,7 +1033,7 @@ class HOIQWEN_SFT(nn.Module):
                 self.compute_prior_scores(x_keep, y_keep, scores, labels)
             )
             all_logits_collated.append(logits)
-            #import pdb; pdb.set_trace()
+            import pdb; pdb.set_trace()
         return (
             all_logits_collated,
             prior_collated,
@@ -952,6 +1041,8 @@ class HOIQWEN_SFT(nn.Module):
             boxes_o_collated,
             object_class_collated,
             gen_losses,
+            attn_losses,
+            attn_n_pairs_list,
         )
 
     def recover_boxes(self, boxes, size):
@@ -1099,7 +1190,7 @@ class HOIQWEN_SFT(nn.Module):
         if self.training and targets is not None:
             text_labels = [t.get('text_label', None) for t in targets]
 
-        logits, prior, bh, bo, objects, gen_losses = self.compute_sim_scores(
+        logits, prior, bh, bo, objects, gen_losses, attn_losses, attn_n_pairs_list = self.compute_sim_scores(
             region_props, images_clip, targets, text_labels=text_labels,
         )
         # if self.training:
@@ -1115,18 +1206,32 @@ class HOIQWEN_SFT(nn.Module):
             bce_loss = self.compute_interaction_loss(
                 boxes, bh, bo, logits, prior, targets,
             )
+            total_loss = bce_loss
+
             if gen_losses:
-                gen_loss_sum = sum(gen_losses) 
+                gen_loss_sum   = sum(gen_losses)
                 gen_loss_count = torch.tensor(len(gen_losses), dtype=torch.float, device=device)
                 if dist.is_available() and dist.is_initialized():
+                    world_size = dist.get_world_size()
+                    dist.barrier()
                     dist.all_reduce(gen_loss_count, op=dist.ReduceOp.SUM)
+                    gen_loss_count = gen_loss_count / world_size
                 gen_loss = gen_loss_sum / gen_loss_count.clamp(min=1)
-                total_loss = bce_loss + self.sft_loss_weight * gen_loss
-                #import pdb; pdb.set_trace()
+                total_loss = total_loss + self.sft_loss_weight * gen_loss
 
-            else:
-                total_loss = bce_loss
-                #import pdb; pdb.set_trace()
+            if attn_losses:
+                attn_loss_sum = sum(attn_losses)
+                n_p_attn = torch.as_tensor([sum(attn_n_pairs_list)], device=device, dtype=torch.float)
+                if dist.is_initialized():
+                    world_size = dist.get_world_size()
+                    dist.barrier()
+                    dist.all_reduce(n_p_attn)
+                    n_p_attn = (n_p_attn / world_size).item()
+                attn_loss = attn_loss_sum / max(n_p_attn, 1)
+                total_loss = total_loss + self.attn_loss_weight * attn_loss
+            
+            #import pdb; pdb.set_trace()
+
             return dict(interaction_loss=total_loss)
 
         if len(logits) == 0:
@@ -1134,21 +1239,23 @@ class HOIQWEN_SFT(nn.Module):
 
         return self.postprocessing(boxes, bh, bo, logits, prior, objects, image_sizes)
 
-    def postprocessing(self, boxes, bh, bo, logits, prior, objects, image_sizes):
+    def postprocessing(self, boxes, bh, bo, logits, prior, objects, image_sizes,):
         n      = [len(b) for b in bh]
         logits = torch.cat(logits).split(n)
 
         detections = []
-        for bx, h, o, lg, pr, obj, size in zip(
+        for bx, h, o, lg, pr, obj,size in zip(
             boxes, bh, bo, logits, prior, objects, image_sizes
         ):
             pr = pr.prod(0)
             x, y = torch.nonzero(pr).unbind(1)
+            # keep = iscores[x] >= 0.15
+            # x, y = x[keep], y[keep]
             scores = torch.sigmoid(lg[x, y])
             detections.append(dict(
                 boxes=bx,
                 pairing=torch.stack([h[x], o[x]]),
-                scores=scores * pr[x, y],
+                scores=scores * pr[x, y],  #weight by interactiveness
                 labels=y,
                 objects=obj[x],
                 size=size,
@@ -1167,6 +1274,7 @@ def build_hoi_sft_detector(
     clip_model_path,
     rank,
     sft_loss_weight: float = 1.0,
+    use_gen_loss:    bool  = True,
     lora_rank:       int   = 8,
 ):
     """
@@ -1224,6 +1332,7 @@ def build_hoi_sft_detector(
         object_class_to_target_class=class_corr,
         object_n_verb_to_interaction=object_n_verb_to_interaction,
         sft_loss_weight=sft_loss_weight,
+        use_gen_loss=use_gen_loss,
         lora_rank=lora_rank,
     )
     return detector

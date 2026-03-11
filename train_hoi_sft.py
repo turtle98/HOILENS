@@ -32,7 +32,7 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
 
-from models.ours_qwen_hoi_sft_inter import build_hoi_sft_detector
+from models.ours_qwen_hoi_sft_inter_new import build_hoi_sft_detector
 from utils.args import get_args
 from engine import CustomisedDLE
 from datasets.hoi_sft_dataset import HOISFTDataset, hoi_sft_collate
@@ -89,6 +89,21 @@ def add_sft_args(parser):
         )
     )
     parser.add_argument(
+        '--use-img-cross-attn', dest='use_img_cross_attn', action='store_true',
+        help='Add a cross-attention layer where ho_queries attend to full image features.'
+    )
+    parser.set_defaults(use_img_cross_attn=False)
+    parser.add_argument(
+        '--use-gt-boxes', dest='use_gt_boxes', action='store_true',
+        help='Use ground-truth boxes during training instead of DETR proposals.'
+    )
+    parser.set_defaults(use_gt_boxes=False)
+    parser.add_argument(
+        '--no-mask-ans-to-img', dest='mask_ans_to_img', action='store_false',
+        help='Allow answer tokens to attend to image tokens (disable the ans→img mask).'
+    )
+    parser.set_defaults(mask_ans_to_img=True)
+    parser.add_argument(
         '--caption-file', default=None, type=str,
         help=(
             'Path to a pre-extracted caption JSON file produced by '
@@ -119,6 +134,9 @@ def main(rank, args):
     np.random.seed(seed)
     random.seed(seed)
     torch.cuda.set_device(rank)
+    # torch.use_deterministic_algorithms(True)
+    # os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8" 
+    #torch.backends.cudnn.deterministic = True
 
     args.clip_model_name = args.clip_dir_vit.split('/')[-1].split('.')[0]
     if args.clip_model_name == 'ViT-B-16':
@@ -137,6 +155,7 @@ def main(rank, args):
         zero_shot=args.zs,
         zs_type=args.zs_type,
         num_classes=args.num_classes,
+        caption_file=os.path.join(args.data_root, 'captions.json'),
         args=args,
     )
     if args.few_shot:
@@ -145,6 +164,7 @@ def main(rank, args):
             partition=args.partitions[0],
             data_root=args.data_root,
             clip_model_name=args.clip_model_name,
+            caption_file=os.path.join(args.data_root, 'captions_test.json'),
             args=args,
         )
     else:
@@ -153,8 +173,16 @@ def main(rank, args):
             partition=args.partitions[1],
             data_root=args.data_root,
             clip_model_name=args.clip_model_name,
+            caption_file=os.path.join(args.data_root, 'captions_test.json'),
             args=args,
         )
+
+    # def seed_worker(worker_id):
+    #     worker_seed = torch.initial_seed() % 2**32
+    #     np.random.seed(worker_seed)
+    #     random.seed(worker_seed)
+
+
 
     train_sampler = DistributedSampler(
         trainset, num_replicas=args.world_size, rank=rank
@@ -200,6 +228,10 @@ def main(rank, args):
         sft_loss_weight=getattr(args, 'sft_loss_weight', 0.5),
         use_gen_loss=getattr(args, 'use_gen_loss', True),
         lora_rank=getattr(args, 'lora_rank', 8),
+        use_img_cross_attn=getattr(args, 'use_img_cross_attn', False),
+        use_gt_boxes=getattr(args, 'use_gt_boxes', False),
+        use_prior=getattr(args, 'use_prior', False),
+        mask_ans_to_img=getattr(args, 'mask_ans_to_img', True),
     )
 
     if args.dataset == 'hicodet' and args.eval:
@@ -364,20 +396,31 @@ def main(rank, args):
         print(f"[INFO] Stage 2 (no Stage 1) — trainable: {n_trainable:,}  (LoRA: {n_lora:,})")
 
     optim        = torch.optim.AdamW(param_dicts, lr=args.lr_head, weight_decay=args.weight_decay)
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optim, args.lr_drop)
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optim, step_size=args.lr_drop)
 
     if checkpoint is not None:
-        optim.load_state_dict(checkpoint['optim_state_dict'])
-        lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        scaler = torch.cuda.amp.GradScaler(enabled=True)
-        scaler.load_state_dict(checkpoint['scaler_state_dict'])
-        engine.update_state_key(
-            optimizer=optim,
-            lr_scheduler=lr_scheduler,
-            epoch=checkpoint['epoch'],
-            iteration=checkpoint['iteration'],
-            scaler=scaler,
-        )
+        ckpt_n_groups = len(checkpoint['optim_state_dict']['param_groups'])
+        cur_n_groups  = len(optim.param_groups)
+        if ckpt_n_groups != cur_n_groups:
+            print(
+                f"[WARNING] Optimizer param groups mismatch "
+                f"(checkpoint: {ckpt_n_groups}, current: {cur_n_groups}). "
+                f"Skipping optimizer/scheduler state (cross-stage resume). "
+                f"Model weights loaded."
+            )
+            engine.update_state_key(optimizer=optim, lr_scheduler=lr_scheduler)
+        else:
+            optim.load_state_dict(checkpoint['optim_state_dict'])
+            lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            scaler = torch.cuda.amp.GradScaler(enabled=True)
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            engine.update_state_key(
+                optimizer=optim,
+                lr_scheduler=lr_scheduler,
+                epoch=checkpoint['epoch'],
+                iteration=checkpoint['iteration'],
+                scaler=scaler,
+            )
     else:
         engine.update_state_key(optimizer=optim, lr_scheduler=lr_scheduler)
 
@@ -414,10 +457,12 @@ if __name__ == '__main__':
     _sys.argv  = _orig_argv
 
     # Merge SFT args into the base namespace
-    args.sft_loss_weight = sft_args.sft_loss_weight
-    args.lora_rank       = sft_args.lora_rank
-    args.use_gen_loss    = sft_args.use_gen_loss
-    args.stage1_epochs   = sft_args.stage1_epochs
+    args.sft_loss_weight    = sft_args.sft_loss_weight
+    args.lora_rank          = sft_args.lora_rank
+    args.use_gen_loss       = sft_args.use_gen_loss
+    args.stage1_epochs      = sft_args.stage1_epochs
+    args.use_img_cross_attn = sft_args.use_img_cross_attn
+    args.use_gt_boxes       = sft_args.use_gt_boxes
     args.lr_drop_stage2  = sft_args.lr_drop_stage2 if sft_args.lr_drop_stage2 is not None else args.lr_drop
 
     print(args)

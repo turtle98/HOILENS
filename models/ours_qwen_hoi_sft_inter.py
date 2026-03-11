@@ -82,6 +82,7 @@ from methods.qwen_utils import (
 )
 from methods.hoi_prompt_utils import (
     HOI_FEAT_TOKEN,
+    HOI_SEP_TOKEN,
     build_hoi_text_prompt,
     build_target_text,
     get_hoi_token_id,
@@ -139,6 +140,7 @@ class HOIQWEN_SFT(nn.Module):
         attn_loss_weight: float = 1.0,
         use_gen_loss:     bool  = True,
         lora_rank:        int   = 8,
+        use_img_cross_attn: bool = False,
     ) -> None:
         super().__init__()
 
@@ -187,12 +189,12 @@ class HOIQWEN_SFT(nn.Module):
         )  # [QWEN_HIDDEN_SIZE, vocab_size]  — pre-transposed for matmul
 
         # ------------------------------------------------------------------
-        # Register <hoi_feat> special token
+        # Register <hoi_feat> and <hoi> special tokens
         # ------------------------------------------------------------------
-        if HOI_FEAT_TOKEN not in self.tokenizer.all_special_tokens:
-            self.tokenizer.add_special_tokens(
-                {"additional_special_tokens": [HOI_FEAT_TOKEN]}
-            )
+        missing = [t for t in [HOI_FEAT_TOKEN, HOI_SEP_TOKEN]
+                   if t not in self.tokenizer.all_special_tokens]
+        if missing:
+            self.tokenizer.add_special_tokens({"additional_special_tokens": missing})
             qwen_model.resize_token_embeddings(len(self.tokenizer))
 
         self.hoi_feat_token_id = get_hoi_token_id(self.tokenizer)
@@ -232,7 +234,12 @@ class HOIQWEN_SFT(nn.Module):
             nn.Linear(256, QWEN_HIDDEN_SIZE)
         )
 
-        self.fusion_scale = nn.Parameter(torch.tensor(0.0))  # exp(0) = 1.0 initial scale
+        self.ho_spatial_fusion_mlp = nn.Sequential(
+            nn.Linear(2 * QWEN_HIDDEN_SIZE, 256), nn.ReLU(),
+            nn.Linear(256, QWEN_HIDDEN_SIZE)
+        )
+
+        #self.fusion_scale = nn.Parameter(torch.tensor(0.0))  # exp(0) = 1.0 initial scale
 
         # Usage
         #fusion_scale = torch.exp(self.fusion_scale)
@@ -240,6 +247,15 @@ class HOIQWEN_SFT(nn.Module):
 
         # Interactiveness classifier (separate from lm_head)
         self.interactiveness_head = nn.Linear(QWEN_HIDDEN_SIZE, 1)
+
+        # Optional cross-attention: ho_queries attend to full image features
+        self.use_img_cross_attn = use_img_cross_attn
+        if use_img_cross_attn:
+            self.ho_img_cross_attn = nn.MultiheadAttention(
+                embed_dim=QWEN_HIDDEN_SIZE,
+                num_heads=QWEN_NUM_HEADS,
+                batch_first=True,
+            )
 
         # ------------------------------------------------------------------
         # Verb / HOI token buffers for BCE scoring — copied from HOIQWEN
@@ -464,27 +480,36 @@ class HOIQWEN_SFT(nn.Module):
             # Freeze LoRA
             for name, p in self.peft_qwen.named_parameters():
                 p.requires_grad = False
-            # Unfreeze head components
+            # Unfreeze all feature-extraction components
             for p in self.interactiveness_head.parameters():
                 p.requires_grad = True
             for p in self.spatial_head.parameters():
                 p.requires_grad = True
             for p in self.ho_fusion_mlp.parameters():
                 p.requires_grad = True
-            self.fusion_scale.requires_grad = True
+            for p in self.ho_spatial_fusion_mlp.parameters():
+                p.requires_grad = True
+            if self.use_img_cross_attn:
+                for p in self.ho_img_cross_attn.parameters():
+                    p.requires_grad = True
+                # for p in self.ho_img_cross_attn_norm.parameters():
+                #     p.requires_grad = True
         elif stage == 2:
-            # Freeze interactiveness_head
+            # Freeze interactiveness_head and all feature-extraction heads
             for p in self.interactiveness_head.parameters():
                 p.requires_grad = False
+            for p in self.spatial_head.parameters():
+                p.requires_grad = False
+            for p in self.ho_fusion_mlp.parameters():
+                p.requires_grad = False
+            for p in self.ho_spatial_fusion_mlp.parameters():
+                p.requires_grad = False
+            if self.use_img_cross_attn:
+                for p in self.ho_img_cross_attn.parameters():
+                    p.requires_grad = False
             # Unfreeze LoRA adapters
             for name, p in self.peft_qwen.named_parameters():
                 p.requires_grad = ("lora_" in name)
-            # Keep spatial heads trainable
-            for p in self.spatial_head.parameters():
-                p.requires_grad = False
-            for p in self.ho_fusion_mlp.parameters():
-                p.requires_grad = False
-            self.fusion_scale.requires_grad = False
         else:
             raise ValueError(f"Unknown training stage: {stage}")
 
@@ -750,27 +775,45 @@ class HOIQWEN_SFT(nn.Module):
                 output_size=(7, 7), spatial_scale=_scale, aligned=True
             )
 
-            ho_feats0 = torchvision.ops.roi_align(
-                _roi_input, roi_ho,
-                output_size=(7, 7), spatial_scale=_scale, aligned=True
-            )
+            # ho_feats0 = torchvision.ops.roi_align(
+            #     _roi_input, roi_ho,
+            #     output_size=(7, 7), spatial_scale=_scale, aligned=True
+            # )
             del _roi_input
-            ho_feats0 = ho_feats0.flatten(2).mean(-1).unsqueeze(0).to(img_feat.dtype)
+            #ho_feats0 = ho_feats0.flatten(2).mean(-1).unsqueeze(0).to(img_feat.dtype)
             h_feats0  = h_feats0.flatten(2).mean(-1).unsqueeze(0).to(img_feat.dtype)
             o_feats0  = o_feats0.flatten(2).mean(-1).unsqueeze(0).to(img_feat.dtype)
             # [1, n_pairs, 2048]
 
-            fusion_output = self.ho_fusion_mlp(
-                torch.cat([h_feats0[0][h_inverse_indices], o_feats0[0][o_inverse_indices]], dim=-1).float()
+            ho_feats0 = self.ho_fusion_mlp(
+                torch.cat([h_feats0[0][h_inverse_indices], o_feats0[0][o_inverse_indices]], dim=-1).unsqueeze(0).float()
             )
-            ho_feats0 = ho_feats0 + (torch.exp(self.fusion_scale) * fusion_output).to(ho_feats0.dtype)
+            #ho_feats0 = ho_feats0 + (torch.exp(self.fusion_scale) * fusion_output).to(ho_feats0.dtype)
+            #ho_feats0 = (fusion_output).to(ho_feats0.dtype).unsqueeze(0)
+            # ho_queries = (
+            #     ho_feats0 +
+            #     pairwise_spatial_reshaped.unsqueeze(0)
+            #     + self.object_embedding[labels[x_keep]].to(torch.bfloat16).unsqueeze(0)
+            #     + self.object_embedding[labels[y_keep]].to(torch.bfloat16).unsqueeze(0)
+            # )  # [1, n_pairs, 2048]
 
-            ho_queries = (
-                ho_feats0 +
-                pairwise_spatial_reshaped.unsqueeze(0)
-                + self.object_embedding[labels[x_keep]].to(torch.bfloat16).unsqueeze(0)
-                + self.object_embedding[labels[y_keep]].to(torch.bfloat16).unsqueeze(0)
-            )  # [1, n_pairs, 2048]
+                        # ------------------------------------------------------------------
+            if self.use_img_cross_attn:
+                attn_out, _ = self.ho_img_cross_attn(
+                    ho_feats0.float(),
+                    img_feat.float(),
+                    img_feat.float(),
+                )
+                ho_feats0 = (ho_feats0.float() + attn_out).to(ho_feats0.dtype)
+
+            ho_queries = self.ho_spatial_fusion_mlp(torch.cat([ho_feats0, pairwise_spatial_reshaped.unsqueeze(0)], dim=-1).float()).to(ho_feats0.dtype)
+
+            # ------------------------------------------------------------------
+            # Optional cross-attention: ho_queries attend to image features
+            # query: [1, n_pairs, 2048]  key/value: [1, num_img_tok, 2048]
+
+
+            #import pdb; pdb.set_trace()
 
             # ------------------------------------------------------------------
             # Splice ho_queries into question embeddings at hoi_feat positions
@@ -815,17 +858,19 @@ class HOIQWEN_SFT(nn.Module):
                     torch.zeros(n_pairs, self.num_classes, device=device, dtype=torch.bfloat16)
                 )
                 inter_logits_collated.append(inter_logits)
+                #torch.sigmoid(inter_logits)
                 boxes_h_collated.append(x_keep)
                 boxes_o_collated.append(y_keep)
                 object_class_collated.append(labels[y_keep])
                 prior_collated.append(self.compute_prior_scores(x_keep, y_keep, scores, labels))
+                #import pdb; pdb.set_trace()
                 continue  # skip LLM forward entirely
 
             # Detach prefix and suffix (they come from frozen no_grad forward)
             q_prefix = q_embeds[:, :hoi_start, :].detach()
             q_suffix = q_embeds[:, hoi_end:, :].detach()
             # ho_queries retains grad through spatial_head
-            combined_q = torch.cat([q_prefix, ho_queries, q_suffix], dim=1)
+            combined_q = torch.cat([q_prefix, ho_queries.to(img_feat.dtype), q_suffix], dim=1)
             # [1, q_len, 2048] — hoi_feat positions now hold ho_queries
 
             # ------------------------------------------------------------------
@@ -1209,7 +1254,7 @@ class HOIQWEN_SFT(nn.Module):
             detections.append(dict(
                 boxes=bx,
                 pairing=torch.stack([h[x], o[x]]),
-                scores=scores * pr[x, y] * iscores[x],  # weight by interactiveness
+                scores=scores * pr[x, y], #* iscores[x],  # weight by interactiveness
                 labels=y,
                 objects=obj[x],
                 size=size,
@@ -1227,9 +1272,10 @@ def build_hoi_sft_detector(
     object_n_verb_to_interaction,
     clip_model_path,
     rank,
-    sft_loss_weight: float = 1.0,
-    lora_rank:       int   = 8,
-    use_gen_loss:    bool  = True,
+    sft_loss_weight:    float = 1.0,
+    lora_rank:          int   = 8,
+    use_gen_loss:       bool  = True,
+    use_img_cross_attn: bool  = False,
 ):
     """
     Build HOIQWEN_SFT detector.  Mirrors build_detector() in ours_qwen_new_old.py.
@@ -1288,5 +1334,6 @@ def build_hoi_sft_detector(
         sft_loss_weight=sft_loss_weight,
         use_gen_loss=use_gen_loss,
         lora_rank=lora_rank,
+        use_img_cross_attn=use_img_cross_attn,
     )
     return detector

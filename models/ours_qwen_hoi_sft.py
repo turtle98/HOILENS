@@ -79,6 +79,7 @@ from methods.qwen_utils import (
 )
 from methods.hoi_prompt_utils import (
     HOI_FEAT_TOKEN,
+    HOI_SEP_TOKEN,
     build_hoi_text_prompt,
     build_target_text,
     get_hoi_token_id,
@@ -136,6 +137,7 @@ class HOIQWEN_SFT(nn.Module):
         attn_loss_weight: float = 1.0,
         use_gen_loss:     bool  = True,
         lora_rank:        int   = 8,
+        use_img_cross_attn: bool = False,
     ) -> None:
         super().__init__()
 
@@ -164,6 +166,7 @@ class HOIQWEN_SFT(nn.Module):
         self.sft_loss_weight             = sft_loss_weight
         self.attn_loss_weight            = attn_loss_weight
         self.use_gen_loss                = use_gen_loss
+        self.training_stage              = 2  # 1 = interactiveness head, 2 = LLM
 
         # ------------------------------------------------------------------
         # Qwen model + processor + tokenizer
@@ -183,12 +186,12 @@ class HOIQWEN_SFT(nn.Module):
         )  # [QWEN_HIDDEN_SIZE, vocab_size]  — pre-transposed for matmul
 
         # ------------------------------------------------------------------
-        # Register <hoi_feat> special token
+        # Register <hoi_feat> and <hoi> special tokens
         # ------------------------------------------------------------------
-        if HOI_FEAT_TOKEN not in self.tokenizer.all_special_tokens:
-            self.tokenizer.add_special_tokens(
-                {"additional_special_tokens": [HOI_FEAT_TOKEN]}
-            )
+        missing = [t for t in [HOI_FEAT_TOKEN, HOI_SEP_TOKEN]
+                   if t not in self.tokenizer.all_special_tokens]
+        if missing:
+            self.tokenizer.add_special_tokens({"additional_special_tokens": missing})
             qwen_model.resize_token_embeddings(len(self.tokenizer))
 
         self.hoi_feat_token_id = get_hoi_token_id(self.tokenizer)
@@ -228,7 +231,18 @@ class HOIQWEN_SFT(nn.Module):
             nn.Linear(512, QWEN_HIDDEN_SIZE)
         )
 
-        self.fusion_scale = nn.Parameter(torch.tensor(0.0))  # exp(0) = 1.0 initial scale
+        self.ho_spatial_fusion_mlp = nn.Sequential(
+            nn.Linear(2 * QWEN_HIDDEN_SIZE, 256), nn.ReLU(),
+            nn.Linear(256, QWEN_HIDDEN_SIZE)
+        )
+
+        # Optional cross-attention: ho_queries attend to full image features
+
+        self.ho_img_cross_attn = nn.MultiheadAttention(
+            embed_dim=QWEN_HIDDEN_SIZE,
+            num_heads=QWEN_NUM_HEADS,
+            batch_first=True,
+        )
 
         # Usage
        # fusion_scale = 
@@ -441,6 +455,47 @@ class HOIQWEN_SFT(nn.Module):
                 i for i in range(self.num_classes)
                 if i not in self.filtered_hoi_idx
             ]
+
+    def set_training_stage(self, stage: int) -> None:
+        """Switch trainable parameters between stages.
+
+        Stage 1 — Train interactiveness_head + spatial_head + ho_fusion_mlp.
+                   LoRA adapters are frozen. LLM forward is skipped entirely.
+        Stage 2 — Freeze interactiveness_head. Train LoRA adapters (+ spatial
+                   heads remain trainable). Uses bce_loss + gen_loss.
+        """
+        self.training_stage = stage
+        if stage == 1:
+            # Freeze LoRA
+            for name, p in self.peft_qwen.named_parameters():
+                p.requires_grad = False
+            # Unfreeze all feature-extraction components
+            for p in self.spatial_head.parameters():
+                p.requires_grad = True
+            for p in self.ho_fusion_mlp.parameters():
+                p.requires_grad = True
+            for p in self.ho_spatial_fusion_mlp.parameters():
+                p.requires_grad = True
+            if self.use_img_cross_attn:
+                for p in self.ho_img_cross_attn.parameters():
+                    p.requires_grad = True
+                # for p in self.ho_img_cross_attn_norm.parameters():
+                #     p.requires_grad = True
+        elif stage == 2:
+            # Freeze interactiveness_head and all feature-extraction heads
+            for p in self.spatial_head.parameters():
+                p.requires_grad = True
+            for p in self.ho_fusion_mlp.parameters():
+                p.requires_grad = True
+            for p in self.ho_spatial_fusion_mlp.parameters():
+                p.requires_grad = True
+            for p in self.ho_img_cross_attn.parameters():
+                    p.requires_grad = True
+            # Unfreeze LoRA adapters
+            for name, p in self.peft_qwen.named_parameters():
+                p.requires_grad = ("lora_" in name)
+        else:
+            raise ValueError(f"Unknown training stage: {stage}")
         #self.verb_bias = nn.Parameter(torch.tensor(15.0))
     # -----------------------------------------------------------------------
     # Qwen inputs builder (SFT version — returns input_ids for position finding)
@@ -461,7 +516,7 @@ class HOIQWEN_SFT(nn.Module):
         q_len          : int  — total question sequence length
         """
         device = next(self.peft_qwen.parameters()).device
-        text_prompt = build_hoi_text_prompt(n_pairs)
+        text_prompt, _ = build_hoi_text_prompt(n_pairs)
 
         with torch.no_grad():
             inputs         = _build_qwen_inputs(
@@ -590,54 +645,6 @@ class HOIQWEN_SFT(nn.Module):
             boxes  = props['boxes']
             scores = props['scores']
             labels = props['labels']
-
-            # is_human = labels == self.human_idx
-            # n_h      = torch.sum(is_human)
-            # n        = len(boxes)
-
-            # if not torch.all(labels[:n_h] == self.human_idx):
-            #     h_idx = torch.nonzero(is_human).squeeze(1)
-            #     o_idx = torch.nonzero(is_human == 0).squeeze(1)
-            #     perm  = torch.cat([h_idx, o_idx])
-            #     boxes  = boxes[perm]
-            #     scores = scores[perm]
-            #     labels = labels[perm]
-
-            # vocab_size = self.lm_head_weight.shape[0]
-
-            # if n_h == 0 or n <= 1:
-            #     boxes_h_collated.append(torch.zeros(0, device=device, dtype=torch.int64))
-            #     boxes_o_collated.append(torch.zeros(0, device=device, dtype=torch.int64))
-            #     object_class_collated.append(torch.zeros(0, device=device, dtype=torch.int64))
-            #     prior_collated.append(
-            #         torch.zeros(2, 0, self.num_classes, device=device)
-            #     )
-            #     all_logits_collated.append(torch.zeros(0, self.num_classes, device=device))
-            #     continue
-
-            # x, y = torch.meshgrid(
-            #     torch.arange(n, device=device), torch.arange(n, device=device)
-            # )
-            # x_keep, y_keep = torch.nonzero(
-            #     torch.logical_and(x != y, x < n_h)
-            # ).unbind(1)
-
-            # if len(x_keep) == 0:
-            #     raise ValueError("There are no valid human-object pairs")
-
-            # if self.training:
-            #     gt_bx_h = self.recover_boxes(targets[b_idx]['boxes_h'], targets[b_idx]['size']).to(targets[b_idx]['object'].device)
-            #     gt_bx_o = self.recover_boxes(targets[b_idx]['boxes_o'], targets[b_idx]['size']).to(targets[b_idx]['object'].device)
-            #     boxes = torch.cat([gt_bx_h, gt_bx_o]).to(targets[b_idx]['object'].device)
-            #     scores = torch.ones([boxes.shape[0]]).to(targets[b_idx]['object'].device)
-            #     labels = torch.cat([torch.zeros([len(gt_bx_h)], dtype=torch.long, device=targets[b_idx]['object'].device), targets[b_idx]['object']])
-            #     N = labels.numel()
-            #     mid = N // 2
-            #     idx = torch.arange(N, device=labels.device)
-            #     x_keep = idx[:mid]
-            #     y_keep = idx[mid:]
-            #     n_h = mid; n = N
-            # else:
             is_human = labels == self.human_idx
             n_h = torch.sum(is_human); n = len(boxes)
             if not torch.all(labels[:n_h] == self.human_idx):
@@ -751,20 +758,28 @@ class HOIQWEN_SFT(nn.Module):
                 output_size=(7, 7), spatial_scale=_scale, aligned=True
             )
 
-            ho_feats0 = torchvision.ops.roi_align(
-                _roi_input, roi_ho,
-                output_size=(7, 7), spatial_scale=_scale, aligned=True
-            )
+            # ho_feats0 = torchvision.ops.roi_align(
+            #     _roi_input, roi_ho,
+            #     output_size=(7, 7), spatial_scale=_scale, aligned=True
+            # )
             del _roi_input
-            ho_feats0 = ho_feats0.flatten(2).mean(-1).unsqueeze(0).to(img_feat.dtype)
+            #ho_feats0 = ho_feats0.flatten(2).mean(-1).unsqueeze(0).to(img_feat.dtype)
             h_feats0  = h_feats0.flatten(2).mean(-1).unsqueeze(0).to(img_feat.dtype)
             o_feats0  = o_feats0.flatten(2).mean(-1).unsqueeze(0).to(img_feat.dtype)
             # [1, n_pairs, 2048]
 
-            fusion_output = self.ho_fusion_mlp(
-                torch.cat([h_feats0[0][h_inverse_indices], o_feats0[0][o_inverse_indices]], dim=-1).float()
+            ho_feats0 = self.ho_fusion_mlp(
+                torch.cat([h_feats0[0][h_inverse_indices], o_feats0[0][o_inverse_indices]], dim=-1).unsqueeze(0).float()
             )
-            ho_feats0 = ho_feats0 + (torch.exp(self.fusion_scale) * fusion_output).to(ho_feats0.dtype)
+            attn_out, _ = self.ho_img_cross_attn(
+                ho_feats0.float(),
+                img_feat.float(),
+                img_feat.float(),
+            )
+            ho_feats0 = (ho_feats0.float() + attn_out)
+            #import pdb; pdb.set_trace()
+
+            ho_queries = self.ho_spatial_fusion_mlp(torch.cat([ho_feats0, pairwise_spatial_reshaped.unsqueeze(0).float()], dim=-1).float()).to(img_feat.dtype)
             # ho_feats0 = ho_feats0 + self.fusion_scale.to(ho_feats0.dtype) * self.ho_fusion_mlp(
             #     torch.cat([h_feats0[0][h_inverse_indices], o_feats0[0][o_inverse_indices]], dim=-1).float()
             # ).to(ho_feats0.dtype)
@@ -776,12 +791,12 @@ class HOIQWEN_SFT(nn.Module):
             # spatial_fused = self.ho_spatial_fusion_mlp(
             #     torch.cat([ho_feats0, pairwise_spatial_reshaped.unsqueeze(0)], dim=-1)
             # )  # [1, n_pairs, 2048]
-            ho_queries = (
-                ho_feats0 +
-                pairwise_spatial_reshaped.unsqueeze(0)
-                + self.object_embedding[labels[x_keep]].to(torch.bfloat16).unsqueeze(0)
-                + self.object_embedding[labels[y_keep]].to(torch.bfloat16).unsqueeze(0)
-            )  # [1, n_pairs, 2048]
+            # ho_queries = (
+            #     ho_feats0 +
+            #     pairwise_spatial_reshaped.unsqueeze(0)
+            #     + self.object_embedding[labels[x_keep]].to(torch.bfloat16).unsqueeze(0)
+            #     + self.object_embedding[labels[y_keep]].to(torch.bfloat16).unsqueeze(0)
+            # )  # [1, n_pairs, 2048]
 
             # ------------------------------------------------------------------
             # Splice ho_queries into question embeddings at hoi_feat positions
@@ -876,34 +891,33 @@ class HOIQWEN_SFT(nn.Module):
                 attention_mask=mask4d,
                 inputs_embeds=combined,
                 use_cache=False,
-                output_attentions=self.training,
                 output_hidden_states=False,
                 return_dict=True,
             )
             hidden = output.last_hidden_state   # [1, total_len, 2048]
             del combined
-            if not self.training:
-                with torch.no_grad():
-                    generated_ids = self.peft_qwen.generate(
-                        inputs_embeds=combined_q,        # [1, q_len, 2048]  — question only
-                        attention_mask=torch.ones(
-                            1, q_len, device=device, dtype=torch.long
-                        ),
-                        max_new_tokens=128,
-                        do_sample=True,      # Enable multinomial sampling
-                        temperature=0.7,     # High (>1.0) is more random, Low (<1.0) is more confident
-                        top_p=0.9,           # Nucleus sampling: keep top 90% cumulative prob tokens
-                        top_k=50,            # Keep top 50 highest probability tokens
+            # if not self.training:
+            #     with torch.no_grad():
+            #         generated_ids = self.peft_qwen.generate(
+            #             inputs_embeds=combined_q,        # [1, q_len, 2048]  — question only
+            #             attention_mask=torch.ones(
+            #                 1, q_len, device=device, dtype=torch.long
+            #             ),
+            #             max_new_tokens=128,
+            #             do_sample=True,      # Enable multinomial sampling
+            #             temperature=0.7,     # High (>1.0) is more random, Low (<1.0) is more confident
+            #             top_p=0.9,           # Nucleus sampling: keep top 90% cumulative prob tokens
+            #             top_k=50,            # Keep top 50 highest probability tokens
                         
-                        eos_token_id=self.tokenizer.eos_token_id,
-                        pad_token_id=self.tokenizer.eos_token_id,
-                    )
+            #             eos_token_id=self.tokenizer.eos_token_id,
+            #             pad_token_id=self.tokenizer.eos_token_id,
+            #         )
 
-            # generated_ids[0] contains only the new tokens if using return_dict_in_generate,
-            # otherwise the full sequence; decode only the generated part:
-            gen_text = self.tokenizer.decode(
-                generated_ids[0], skip_special_tokens=True
-            )
+            # # generated_ids[0] contains only the new tokens if using return_dict_in_generate,
+            # # otherwise the full sequence; decode only the generated part:
+            # gen_text = self.tokenizer.decode(
+            #     generated_ids[0], skip_special_tokens=True
+            # )
 
             # ------------------------------------------------------------------
             # BCE scoring  (same path as HOIQWEN.compute_sim_scores)
@@ -979,7 +993,7 @@ class HOIQWEN_SFT(nn.Module):
             # Generation loss (SFT cross-entropy)
             # ------------------------------------------------------------------
 
-            # print(self.tokenizer.decode(torch.topk(ho_vocab[2], 200, dim=-1)[1]))
+            # print(self.tokenizer.decode(torch.topk(ho_vocab[7], 200, dim=-1)[1]))
             # import pdb; pdb.set_trace()
 
             if self.training and output.attentions:
@@ -1033,7 +1047,7 @@ class HOIQWEN_SFT(nn.Module):
                 self.compute_prior_scores(x_keep, y_keep, scores, labels)
             )
             all_logits_collated.append(logits)
-            import pdb; pdb.set_trace()
+            #import pdb; pdb.set_trace()
         return (
             all_logits_collated,
             prior_collated,
@@ -1276,6 +1290,7 @@ def build_hoi_sft_detector(
     sft_loss_weight: float = 1.0,
     use_gen_loss:    bool  = True,
     lora_rank:       int   = 8,
+    use_img_cross_attn: bool  = False,
 ):
     """
     Build HOIQWEN_SFT detector.  Mirrors build_detector() in ours_qwen_new_old.py.
@@ -1334,5 +1349,6 @@ def build_hoi_sft_detector(
         sft_loss_weight=sft_loss_weight,
         use_gen_loss=use_gen_loss,
         lora_rank=lora_rank,
+        use_img_cross_attn=use_img_cross_attn,
     )
     return detector

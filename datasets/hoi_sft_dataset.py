@@ -23,7 +23,7 @@ import json
 import os
 import torch
 from datasets import DataFactory
-from methods.hoi_prompt_utils import build_target_text_detailed
+from methods.hoi_prompt_utils import build_target_text_detailed, build_target_text_with_boxes
 
 
 class HOISFTDataset(DataFactory):
@@ -36,6 +36,9 @@ class HOISFTDataset(DataFactory):
             scripts/extract_hoi_captions.py.  Maps image filename →
             detailed caption string.  If None or a filename is missing,
             falls back to the structured build_target_text_detailed() output.
+        unseen_split (str | None): Zero-shot split name from hico_unseen_index
+            (e.g. "uc0", "rare_first"). HOIs in this split are excluded from
+            negative entries in the fallback caption. None = fully supervised.
         All other args are forwarded to DataFactory.__init__.
     """
 
@@ -43,8 +46,17 @@ class HOISFTDataset(DataFactory):
         os.path.dirname(__file__), "..", "hicodet", "captions.json"
     ))
 
-    def __init__(self, *args, caption_file: str | None = _DEFAULT_CAPTION_FILE, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, *args, caption_file: str | None = _DEFAULT_CAPTION_FILE,
+                 zero_shot: bool = False, zs_type: str | None = None, **kwargs):
+        super().__init__(*args, zero_shot=zero_shot, zs_type=zs_type, **kwargs)
+
+        if zero_shot and zs_type is not None:
+            from utils.hico_text_label import hico_unseen_index
+            self._unseen_ids: set[int] = set(hico_unseen_index.get(zs_type, []))
+            print(f"[HOISFTDataset] Zero-shot split '{zs_type}': "
+                  f"{len(self._unseen_ids)} unseen HOI classes excluded from negatives.")
+        else:
+            self._unseen_ids = set()
 
         self._captions: dict[str, str] = {}
         if caption_file is not None:
@@ -85,11 +97,7 @@ class HOISFTDataset(DataFactory):
     # ------------------------------------------------------------------
 
     def _fallback_caption(self, target: dict) -> str:
-        if "hoi" in target:
-            hoi_indices = target["hoi"]
-        else:
-            hoi_indices = target.get("labels", torch.zeros(0, dtype=torch.long))
-        return build_target_text_detailed(hoi_indices)
+        return build_target_text_with_boxes(target, unseen_ids=self._unseen_ids)
 
 
 # ---------------------------------------------------------------------------

@@ -19,7 +19,43 @@ from scipy.optimize import linear_sum_assignment
 
 from detr.util.box_ops import generalized_box_iou
 
+            # if output.attentions:
+            #     import matplotlib.pyplot as plt
+            #     import matplotlib.cm as cm
+            #     from PIL import Image as PilImage
 
+            #     # Mean over all layers and heads → [total_len, total_len]
+            #     attn_all = torch.stack([a[0] for a in output.attentions]).mean(0).mean(0).float()
+            #     # HO queries attending to image tokens: [n_pairs, n_img_toks]
+            #     attn_hoi_img = attn_all[hoi_start:hoi_end, img_start:img_end].cpu()
+            #     # Reshape to spatial grid: [n_pairs, grid_h, grid_w]
+            #     attn_grid = attn_hoi_img.reshape(n_pairs, grid_h, grid_w).numpy()
+
+            #     img_w, img_h = pil_img.size
+            #     img_np = np.array(pil_img.convert("RGB")) / 255.0
+
+            #     os.makedirs("attn_vis", exist_ok=True)
+            #     for pair_i in range(n_pairs):
+            #         attn_map = attn_grid[pair_i]  # [grid_h, grid_w]
+            #         attn_min, attn_max = attn_map.min(), attn_map.max()
+            #         if attn_max > attn_min:
+            #             attn_map = (attn_map - attn_min) / (attn_max - attn_min)
+
+            #         attn_up = np.array(
+            #             PilImage.fromarray((attn_map * 255).astype(np.uint8)).resize(
+            #                 (img_w, img_h), resample=PilImage.BILINEAR
+            #             )
+            #         ) / 255.0  # [img_h, img_w]
+
+            #         heatmap = cm.jet(attn_up)[..., :3]  # [img_h, img_w, 3]
+            #         overlay = 0.5 * img_np + 0.5 * heatmap
+
+            #         fig, ax = plt.subplots(figsize=(6, 6))
+            #         ax.imshow(np.clip(overlay, 0, 1))
+            #         ax.axis("off")
+            #         ax.set_title(f"HO pair {pair_i}: person#{x_keep[pair_i].item()} – obj#{y_keep[pair_i].item()}")
+            #         fig.savefig(f"attn_vis/b{b_idx}_pair{pair_i}.png", bbox_inches="tight", dpi=100)
+            #         plt.close(fig)
 
 def box_cxcywh_to_xyxy(x):
     x_c, y_c, w, h = x.unbind(-1)

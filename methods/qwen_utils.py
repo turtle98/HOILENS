@@ -68,7 +68,7 @@ except ImportError:
 QWEN_MODEL_ID         = "Qwen/Qwen2.5-VL-3B-Instruct"
 QWEN_HIDDEN_SIZE      = 2048        # LLM hidden dim      (LLaVA 7B: 4096)
 QWEN_NUM_LAYERS       = 28          # transformer layers  (LLaVA 7B: 32)
-QWEN_IMAGE_SIZE       = 448   # fixed input resolution
+QWEN_IMAGE_SIZE       = 448 # fixed input resolution
 QWEN_PATCH_SIZE       = 14         # ViT patch size in pixels
 QWEN_MERGE_SIZE       = 2           # spatial merge factor (2×2 → 4 patches / token)
 QWEN_GRID_H           = QWEN_IMAGE_SIZE // (QWEN_PATCH_SIZE * QWEN_MERGE_SIZE)  # 16
